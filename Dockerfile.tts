@@ -1,0 +1,41 @@
+# TTS-enabled llama-server image (llama.cpp PR #26603, branch xsn/server_tts_2).
+# Adds POST /tts to llama-server: resident model, --ctx-size, streaming PCM.
+#
+# USAGE — two files, one command (Ubuntu WSL):
+#   1. Dockerfile.tts        this file
+#   2. llama_tts2.tar.gz     PR branch source tarball, download on Windows:
+#     curl -L -o llama_tts2.tar.gz ^
+#       https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/heads/xsn/server_tts_2
+#     (git clone / in-Dockerfile ADD cannot be used: GitHub is unreachable
+#      from Ubuntu WSL on this machine; the tarball must be pre-fetched)
+#   Then, with both files in the same directory:
+#     docker build -t llama-cuda-tts:local -f Dockerfile.tts .
+#
+# Build takes ~15-30 min (CUDA kernels for one arch = sm_120, 8 cores).
+# Why two stages: compile needs the CUDA devel toolchain (nvcc); the runtime
+# base ghcr.io/ggml-org/llama.cpp:full-cuda ships no compiler. Merging into a
+# single devel stage would work but bloats the image 10.3GB -> 14.6GB.
+
+FROM docker.1ms.run/nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git cmake build-essential ccache libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+# tarball pre-downloaded on the Windows side (git clone is unreliable here)
+COPY llama_tts2.tar.gz /tmp/src.tar.gz
+RUN tar -xzf /tmp/src.tar.gz --strip-components=1 -C /src && rm /tmp/src.tar.gz
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs
+# RTX 5060 Ti is Blackwell (sm_120): build only for it to keep compile time sane
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1 \
+    && ldconfig \
+    && cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="120" \
+        -DLLAMA_CURL=ON -DGGML_NATIVE=ON \
+    && cmake --build build --config Release -j$(nproc) --target llama-server
+
+FROM ghcr.io/ggml-org/llama.cpp:full-cuda AS runtime
+
+COPY --from=build /src/build/bin/ /app/
+
+
+WORKDIR /app
+ENTRYPOINT ["/app/llama-server"]
