@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 import httpx
 import numpy as np
@@ -40,7 +41,8 @@ class TtsWorkerPool:
         self._speaker_b64: str | None = None
         if speaker_path:
             import base64
-            self._speaker_b64 = base64.b64encode(open(speaker_path, "rb").read()).decode("ascii")
+            with open(speaker_path, "rb") as fh:
+                self._speaker_b64 = base64.b64encode(fh.read()).decode("ascii")
         self._jobs: queue.Queue[tuple[int, str] | None] = queue.Queue()
         self._seq = 0
         self._seq_lock = threading.Lock()
@@ -74,12 +76,18 @@ class TtsWorkerPool:
         self._stop.set()
         for _ in self._threads:
             self._jobs.put(None)
+        # Abort in-flight streams first: a worker blocked in a long read would
+        # otherwise sit out its whole join window, and the budget below is for
+        # the whole pool, not per worker.
+        self._client.close()
+        deadline = time.monotonic() + 3.0
+        for t in self._threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
 
     # -- internals -----------------------------------------------------------
 
     def _synthesize(self, seq: int, sentence: str) -> None:
         rate = 24_000
-        sent_any = False
         byte_buf = b""  # carries partial floats across TCP chunks
         samples = np.zeros(0, dtype=np.float32)
         body = {"input": sentence, "lang": self._lang,
@@ -98,12 +106,10 @@ class TtsWorkerPool:
                 byte_buf = byte_buf[usable:]
                 while len(samples) >= self._chunk:
                     self._player.put(seq, samples[: int(self._chunk)], rate)
-                    sent_any = True
                     samples = samples[int(self._chunk):]
-        if len(samples) or not sent_any:
-            self._player.put(seq, samples, rate, final=True)
-        else:
-            self._player.put(seq, np.zeros(0, dtype=np.float32), rate, final=True)
+        # always mark the segment final — an empty one is a tombstone, and
+        # without it the player would wait for this seq forever
+        self._player.put(seq, samples, rate, final=True)
 
     def _loop(self) -> None:
         while not self._stop.is_set():

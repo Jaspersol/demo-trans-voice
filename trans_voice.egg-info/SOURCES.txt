@@ -4,8 +4,10 @@ pipeline/app.py
 pipeline/asr_client.py
 pipeline/capture.py
 pipeline/config.py
+pipeline/gui.py
 pipeline/playback.py
 pipeline/segmenter.py
+pipeline/tray.py
 pipeline/tts_workers.py
 trans_voice.egg-info/PKG-INFO
 trans_voice.egg-info/SOURCES.txt

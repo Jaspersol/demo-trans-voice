@@ -1,2 +1,5 @@
 [console_scripts]
 trans-voice = pipeline.app:main
+
+[gui_scripts]
+trans-voice-gui = pipeline.gui:main

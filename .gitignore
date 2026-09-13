@@ -1,0 +1,11 @@
+# Build output — see trans-voice.spec
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environment
+.venv/

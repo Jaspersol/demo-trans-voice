@@ -17,7 +17,6 @@ The caller drives two entry points:
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # Marks that end a sentence: `?`/`!` from the model (reliable) plus the `。` this
@@ -59,10 +58,6 @@ class Segmenter:
     _buffer: str = field(default="", init=False)
 
     # -- state ---------------------------------------------------------------
-
-    @property
-    def buffered(self) -> str:
-        return self._buffer
 
     @property
     def empty(self) -> bool:

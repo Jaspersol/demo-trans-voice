@@ -12,7 +12,6 @@ Design:
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
 
 import numpy as np
 
@@ -62,6 +61,11 @@ class RingBuffer:
             return np.concatenate([self._buf[start:], self._buf[: start + n - self._cap]])
 
     @property
+    def capacity_seconds(self) -> float:
+        """Audio the ring retains: a wider window can never be read back."""
+        return self._cap / SAMPLE_RATE
+
+    @property
     def seconds(self) -> float:
         """True stream time (total written), not retained duration — used as
         the ASR cursor reference so it never goes backwards after wrap."""
@@ -109,7 +113,6 @@ class MicCapture:
         self,
         ring: RingBuffer,
         device: int | str | None = None,
-        on_frame: Callable[[np.ndarray], None] | None = None,
         gain: float = 1.0,
     ) -> None:
         import sounddevice as sd
@@ -124,7 +127,6 @@ class MicCapture:
             device=self._resolve_device(sd, device),
             callback=self._callback,
         )
-        self._on_frame = on_frame
 
     @staticmethod
     def _resolve_device(sd, device, kind: str = "input") -> int | None:  # noqa: ANN001
@@ -154,8 +156,6 @@ class MicCapture:
             np.multiply(mono, self._gain, out=mono)
             np.clip(mono, -1.0, 1.0, out=mono)
         self.ring.write(mono)
-        if self._on_frame is not None:
-            self._on_frame(mono)
 
     def __enter__(self) -> "MicCapture":
         self._stream.start()

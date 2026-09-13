@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
 
 import numpy as np
 
@@ -67,12 +66,6 @@ class AudioPlayer:
     def release(self) -> None:
         """Start playing whatever is buffered (idempotent)."""
         self.set_hold(False)
-
-    @property
-    def hold(self) -> bool:
-        """True while playback is still held for the current round."""
-        with self._cv:
-            return self._hold
 
     @property
     def pending_audio(self) -> bool:
@@ -135,6 +128,10 @@ class AudioPlayer:
             blocksize=0,  # let PortAudio pick low-latency
         )
         stream.start()
+        # keep it: the player reuses one device stream for every segment of
+        # that rate (otherwise each sentence opens a new one and leaks the old)
+        self._stream = stream
+        self._opened_rate = rate
         return stream
 
     def _run(self) -> None:
@@ -190,13 +187,3 @@ class AudioPlayer:
                     return self._next_seq, seg
                 self._cv.wait(timeout=0.2)
         return None
-
-
-def list_devices() -> Callable[[], str]:
-    """Helper for CLI: returns a printable device table."""
-    import sounddevice as sd
-
-    def render() -> str:
-        return str(sd.query_devices())
-
-    return render

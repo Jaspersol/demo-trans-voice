@@ -7,3 +7,5 @@ Requires-Dist: numpy>=2.0
 Requires-Dist: sounddevice>=0.5
 Requires-Dist: soundfile>=0.13
 Requires-Dist: httpx>=0.28
+Provides-Extra: build
+Requires-Dist: pyinstaller>=6.10; extra == "build"

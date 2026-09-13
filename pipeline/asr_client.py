@@ -21,11 +21,11 @@ import base64
 import io
 import json
 import re
+import sys
 import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 
 import httpx
 import numpy as np
@@ -38,76 +38,6 @@ READ_TIMEOUT_S = 3.0
 
 def strip_metadata(text: str) -> str:
     return METADATA_RE.sub("", text)
-
-
-# punctuation/whitespace ignored when matching a re-stated overlap (the model
-# re-transcribes the context audio with slightly different punctuation)
-_NOISE_CHARS = set("，。！？；：、,.!?;:… \t\n\u3000\"'”』)]）」’")
-MIN_OVERLAP = 4          # normalized chars: smallest exact re-statement we trust
-FUZZY_MIN_OVERLAP = 4    # normalized chars: smallest drifted alignment we trust
-
-
-def normalize_text(text: str) -> str:
-    """Drop punctuation/whitespace — the form used for all overlap matching."""
-    return "".join(c for c in text if c not in _NOISE_CHARS)
-
-
-def strip_overlap(known: str, text: str) -> str:
-    """Cut ``text`` where the already-handled text (``known``) ends.
-
-    Each ASR window carries ``asr_context_seconds`` of already-transcribed
-    audio, so the model re-emits that older audio — and because the window
-    start moves (``ctx_start = cursor - context``) while the cursor also jumps
-    forward on a silence commit, the re-stated part is *not* always at the head
-    of the answer: the head can correspond to audio older than the end of what
-    we already fed. Assuming "answer head == fed tail" therefore misses the
-    overlap and the same sentence gets fed (and spoken) twice.
-
-    Instead, align the *end* of ``known`` inside ``text`` (exact matches first,
-    then fuzzy, punctuation/whitespace-insensitive) and cut right after the
-    aligned position. Returns ``text`` unchanged when the answer carries no
-    recognisable re-statement (and ``""`` when it is one entirely)."""
-    known_norm = normalize_text(known)
-    text_norm = normalize_text(text)
-    if not known_norm or not text_norm:
-        return text
-
-    def cut_at_norm(index: int) -> str:
-        """Drop the first ``index`` normalized chars of ``text``."""
-        if index <= 0:
-            return text
-        seen = 0
-        for i, ch in enumerate(text):
-            if ch not in _NOISE_CHARS:
-                seen += 1
-                if seen == index:
-                    return text[i + 1:].lstrip("".join(_NOISE_CHARS))
-        return ""
-
-    # the answer is nothing but a re-statement of what we already have
-    if text_norm == known_norm[-len(text_norm):]:
-        return ""
-
-    # exact: longest tail of `known` that occurs in `text`; cut after it
-    for size in range(min(len(known_norm), len(text_norm)), MIN_OVERLAP - 1, -1):
-        pos = text_norm.find(known_norm[-size:])
-        if pos >= 0:
-            return cut_at_norm(pos + size)
-
-    # fuzzy: align `known` against `text` and cut after the block that gets
-    # furthest into `known` — the tail may have drifted by a character or two,
-    # so a block reaching within 2 chars of the end still marks the boundary
-    threshold = min(FUZZY_MIN_OVERLAP, len(known_norm))
-    furthest_end = -1  # progress in known
-    cut = 0            # corresponding progress in text
-    for block in SequenceMatcher(None, known_norm, text_norm, autojunk=False).get_matching_blocks():
-        if block.size and block.size >= threshold and block.a + block.size >= len(known_norm) - 2:
-            if block.a + block.size > furthest_end:
-                furthest_end = block.a + block.size
-                cut = block.b + block.size
-    if furthest_end >= 0:
-        return cut_at_norm(cut)
-    return text
 
 
 def wav_base64(pcm: np.ndarray, sample_rate: int = 16_000) -> str:
@@ -195,6 +125,10 @@ class AsrClient:
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
+    def close(self) -> None:
+        """Release the HTTP connection pool (called once from Pipeline.shutdown)."""
+        self._client.close()
+
 
 def _sse_content_deltas(lines: Iterator[str | bytes]) -> Iterator[str]:
     for raw in lines:
@@ -264,15 +198,10 @@ class AsrWorker:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
 
-    def pending(self) -> int:
-        """Queued-but-unstarted snapshots."""
-        with self._wake:
-            return len(self._jobs)
-
     def submit(self, window_start: float, window_end: float, pcm: np.ndarray) -> bool:
         """Queue a snapshot window. Returns False when the worker is busy and
-        the backlog cap is hit (the caller should skip this tick; the next one
-        covers the audio via cursor-never-regression)."""
+        the backlog cap is hit: the caller keeps its cursor and retries that
+        same audio on the next tick — the block is never dropped."""
         with self._wake:
             if self._busy and len(self._jobs) >= self._max_backlog:
                 return False
@@ -302,9 +231,16 @@ class AsrWorker:
                 else:
                     text = strip_metadata(self._client.transcribe(job.pcm)).strip()
                     self._publish(job, text, partial=False)
-            except Exception:
-                # failed snapshot: report an empty result carrying its window
-                # so the caller keeps its cursor/interval logic
+            except Exception as exc:
+                # A failed snapshot must still publish (the caller's cursor and
+                # gate logic depend on it), but it must not be silent: without
+                # this line a dead/wrong ASR server looks exactly like "nothing
+                # to transcribe" — no text, no TTS, no error, forever.
+                print(
+                    f"[asr] 请求失败 ({job.window_end - job.window_start:.1f}s 音频): {exc!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._publish(job, "", partial=False)
 
     def _transcribe_streaming(self, job: AsrRequest) -> None:

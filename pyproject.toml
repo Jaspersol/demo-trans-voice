@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trans-voice"
+version = "0.1.0"
+description = "Real-time ASR->TTS pause-driven voice pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "sounddevice>=0.5",
+    "soundfile>=0.13",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+trans-voice = "pipeline.app:main"
+
+# Windows installs a console-less launcher for this one, so no black window
+# flashes behind the control panel.
+[project.gui-scripts]
+trans-voice-gui = "pipeline.gui:main"
+
+# Frozen builds: `python -m PyInstaller trans-voice.spec` (see the spec header).
+[project.optional-dependencies]
+build = ["pyinstaller>=6.10"]
+
+[tool.setuptools]
+packages = ["pipeline"]

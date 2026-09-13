@@ -12,7 +12,9 @@ Timing model — two knobs, no sliding windows:
 Each ASR call covers a contiguous audio block whose end lies *inside* a pause, so
 the model never sees a word cut in half, nothing is re-transcribed (no context,
 no overlap de-duplication) and the model's own punctuation is only a prosody hint
-(see ``segmenter.normalize_punct``).
+(see ``segmenter.normalize_punct``). A block the worker refuses because its
+backlog is full keeps its cursor and is retried on the next tick, so a slow
+server costs latency but never drops speech.
 
 Threads:
   - capture (sounddevice callback thread, via MicCapture)
@@ -31,12 +33,13 @@ import sys
 import threading
 import time
 from collections import deque
+from enum import Enum
 
 import numpy as np
 
 from pipeline.asr_client import AsrClient, AsrWorker
 from pipeline.capture import SAMPLE_RATE, MicCapture, RingBuffer
-from pipeline.config import parse_args_with_config
+from pipeline.config import parse_args_with_config, resolve_path
 from pipeline.playback import AudioPlayer
 from pipeline.segmenter import CUT_PUNCT, Segmenter, normalize_punct
 from pipeline.tts_workers import TtsWorkerPool
@@ -47,11 +50,27 @@ MIN_VOICED_FRACTION = 0.15  # a block must contain this much speech, else it is 
 # measured spin-up lags the real pause by roughly this much. Adding it back makes
 # sentence_gap_ms / utterance_gap_ms mean "the pause you actually make".
 SILENCE_OFFSET_MS = 100.0
+# Quiet-state poll cadence: the gap timers are sampled at this rate, so a slower
+# tick would swallow most of a 450 ms sentence pause. Not configurable on
+# purpose — one 0.05 s energy read costs ~4 us, there is nothing to save here.
+IDLE_POLL_S = 0.05
+
+
+class CallOutcome(Enum):
+    """What :meth:`Pipeline._call_asr` did with one audio block."""
+
+    QUEUED = "queued"    # worker accepted it; the cursor may advance
+    SKIPPED = "skipped"  # not worth a request (too short / evicted / no speech)
+    BUSY = "busy"        # backlog full: the audio is still owed, retry it
 
 
 class Pipeline:
     def __init__(self, args: argparse.Namespace) -> None:
         self.ring = RingBuffer(max_seconds=args.window_seconds + 2.0)
+        # A block must never ask for more audio than the ring still holds: cap
+        # it (1 s of slack for the read), so a jammed backlog splits the audio
+        # into consecutive blocks instead of letting the head be evicted.
+        self._max_block_s = self.ring.capacity_seconds - 1.0
         self.asr = AsrClient(
             base_url=args.asr_url, model=args.asr_model, language=args.language
         )
@@ -65,7 +84,7 @@ class Pipeline:
             player=self.player,
             lang=args.tts_lang,
             workers=args.tts_workers,
-            speaker_path=args.speaker_ref,
+            speaker_path=resolve_path(args.speaker_ref),
         )
         self.sentences: queue.Queue[str] = queue.Queue()
         self._stop = threading.Event()
@@ -88,7 +107,6 @@ class Pipeline:
 
     def asr_loop(self) -> None:
         interval = self.args.asr_interval_ms / 1000.0
-        idle_interval = self.args.asr_idle_interval_ms / 1000.0
         threshold = self.args.silence_threshold
         sentence_gap = self.args.sentence_gap_ms
         utterance_gap = self.args.utterance_gap_ms
@@ -96,7 +114,12 @@ class Pipeline:
         stream_mode = self.args.asr_stream
         mute = self.args.mute_during_tts
 
+        # Set when a full backlog refused a block: it holds that block's `pause`
+        # flag, i.e. its audio is still owed and gets retried on the next tick
+        # (None = nothing owed).
+        held_pause: bool | None = None
         block_start = 0.0   # stream time where the pending audio block begins
+        leftover = False    # last submit was cut short: audio is still waiting
         called = False      # this quiet span already made its ASR call
         dirty = False       # something happened since the last utterance end
         quiet_since: float | None = None
@@ -135,14 +158,31 @@ class Pipeline:
                     for s in self.segmenter.push(chunk):
                         self.sentences.put(s)
 
+            # A block the worker refused because its backlog was full is still
+            # owed: retry it before anything else can move the cursor past its
+            # audio. The refused block's `pause` rides along, so a forced
+            # long-speech chunk does not suddenly gain a sentence boundary.
+            if held_pause is not None:
+                outcome, end = self._submit_block(
+                    block_start, now_s, threshold, pause=held_pause, pending=pending
+                )
+                if outcome is not CallOutcome.BUSY:
+                    held_pause = None
+                    block_start = end
+                    leftover = end < now_s
+                    called = True
+
             if mute and gated:
                 if not self._playback_drained(pending):
                     # Small slices: playback can end mid-interval and the gate
                     # must reopen as soon as the audio is done.
-                    self._stop.wait(min(interval, 0.05))
+                    self._stop.wait(min(interval, IDLE_POLL_S))
                     continue
-                # playback over: skip the played span, resume immediately
+                # playback over: skip the played span (our own TTS, plus whatever
+                # the speaker said over it), resume immediately
                 block_start = now_s
+                held_pause = None
+                leftover = False
                 quiet_since = None
                 called = False
                 gated = False
@@ -162,51 +202,138 @@ class Pipeline:
                 dirty = True  # speech happened: there will be something to process
 
             # Long unbroken speech: call anyway so the block cannot grow forever.
-            if not quiet and now_s - block_start >= chunk_cap:
-                if self._call_asr(block_start, now_s, threshold, pause=False, pending=pending):
-                    dirty = True
-                block_start = now_s
+            # `leftover` means the previous submit was cut at the ring cap, so
+            # the rest of that speech ships on the next tick instead of waiting
+            # for the age to build up again.
+            if (
+                not quiet
+                and (leftover or now_s - block_start >= chunk_cap)
+                and held_pause is None
+            ):
+                outcome, end = self._submit_block(
+                    block_start, now_s, threshold, pause=False, pending=pending
+                )
+                if outcome is CallOutcome.BUSY:
+                    held_pause = False  # keep the audio, split it on the retry
+                else:
+                    block_start = end
+                    leftover = end < now_s
 
             # Sentence gap (streaming only): the pause ends this sentence, so its
             # audio goes out now — one complete sentence per request.
-            if stream_mode and quiet and silence_ms >= sentence_gap and not called:
-                if self._call_asr(block_start, now_s, threshold, pause=True, pending=pending):
-                    dirty = True
-                block_start = now_s
-                called = True
-
-            # Utterance gap: the segment is over. Streaming counts the sentence
-            # gap *plus* the utterance gap (G1+G2) — the utterance gap is the
-            # extra silence that confirms the speaker is done; batch has no
-            # sentence gap at all and fires on G2 alone.
-            end_at = sentence_gap + utterance_gap if stream_mode else utterance_gap
-            if quiet and silence_ms >= end_at and dirty:
-                if not stream_mode:
-                    if self._call_asr(block_start, now_s, threshold, pause=True, pending=pending):
+            if (
+                stream_mode
+                and quiet
+                and silence_ms >= sentence_gap
+                and not called
+                and held_pause is None
+            ):
+                outcome, end = self._submit_block(
+                    block_start, now_s, threshold, pause=True, pending=pending
+                )
+                if outcome is CallOutcome.BUSY:
+                    held_pause = True  # owed: the retry step above picks it up
+                else:
+                    block_start = end
+                    leftover = end < now_s
+                    called = True
+                    if outcome is CallOutcome.QUEUED:
                         dirty = True
-                block_start = now_s
-                for s in self.segmenter.flush():
-                    self.sentences.put(s)
-                if mute:
-                    self.player.release()  # start playing now
-                    gated = True
-                dirty = False
-                quiet_since = None
-                called = False
+
+            # Utterance gap: the segment is over. Both modes use the same
+            # absolute silence — utterance_gap_ms counted from the last speech,
+            # NOT from the sentence gap: streaming already fired this sentence's
+            # call at G1, so this branch is only the "stopped talking"
+            # confirmation that flushes the rest and starts playback.
+            if quiet and silence_ms >= utterance_gap and dirty and held_pause is None:
+                # Batch: this is the utterance's one request. Streaming normally
+                # has nothing left (the G1 call took the speech; the trailing
+                # pause alone is SKIPPED), but a jam can leave audio behind —
+                # send that before closing the segment.
+                if leftover or not stream_mode:
+                    outcome, end = self._submit_block(
+                        block_start, now_s, threshold, pause=True, pending=pending
+                    )
+                    if outcome is CallOutcome.BUSY:
+                        # no room: keep its audio and the segment open, retry
+                        # instead of dropping it
+                        held_pause = True
+                    else:
+                        block_start = end
+                        leftover = end < now_s
+                if held_pause is None and not leftover:
+                    # segment over: flush, release playback, clear the span
+                    block_start = now_s
+                    leftover = False
+                    for s in self.segmenter.flush():
+                        self.sentences.put(s)
+                    if mute:
+                        self.player.release()  # start playing now
+                        gated = True
+                    dirty = False
+                    quiet_since = None
+                    called = False
 
             if ambient_log_at and now_t >= ambient_log_at:
                 # informational: gives a number to calibrate silence_threshold
+                ambient = self.ring.energy(0.5)
                 print(
-                    f"[asr] 环境RMS≈{self.ring.energy(0.5):.5f} 门限={threshold:g}"
+                    f"[asr] 环境RMS≈{ambient:.5f} 门限={threshold:g}"
                     f"（噪声被当有声就调高 silence_threshold，漏字就调低）",
                     flush=True,
                 )
+                if ambient >= threshold:
+                    # deterministic misconfiguration: silence can never be
+                    # detected, so no pause ever triggers and 外放 never starts
+                    print(
+                        f"[asr] 警告：门限 {threshold:g} 不高于环境底噪 {ambient:.5f} —— "
+                        f"静默永远不成立（不会按停顿切句、外放也不会开始播放）。"
+                        f"先把 silence_threshold 提到 {ambient * 2:.2f}~{ambient * 3:.2f}，"
+                        f"并确认说话时 GUI 状态栏显示【有声】",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 ambient_log_at = None
 
             if quiet:
-                self._stop.wait(min(idle_interval, 0.05))
+                self._stop.wait(IDLE_POLL_S)
             else:
                 self._wait_tick(interval)
+
+    def _submit_block(
+        self,
+        start: float,
+        now_s: float,
+        threshold: float,
+        pause: bool,
+        pending: deque[dict],
+    ) -> tuple[CallOutcome, float]:
+        """Submit ``[start, end)`` with ``end`` capped at what the ring can still
+        return. A jammed backlog then splits the audio into consecutive blocks
+        instead of letting one block outgrow the ring and be dropped whole;
+        ``end < now_s`` tells the caller there is audio left over.
+
+        The ring only holds the trailing ``capacity_seconds`` of audio: if the
+        cursor sat un-submitted longer than that (a backlog jam), its head is
+        already gone. Resync to the oldest audio still available — the evicted
+        head is lost either way, but the newest ~9 s are kept instead of the
+        whole block being refused. Returns the outcome and the window end that
+        was asked for."""
+        oldest = now_s - self._max_block_s
+        dropped = 0.0
+        if start < oldest:
+            dropped = oldest - start
+            start = oldest
+        end = min(now_s, start + self._max_block_s)
+        outcome = self._call_asr(start, end, threshold, pause=pause, pending=pending)
+        if dropped and outcome is not CallOutcome.BUSY:
+            # only once the retry actually goes through, not on every attempt
+            print(
+                f"[asr] 积压:丢弃最早 {dropped:.1f}s(环 {self.ring.capacity_seconds:.0f}s),"
+                f"保留最近 {end - start:.1f}s",
+                file=sys.stderr,
+            )
+        return outcome, end
 
     def _call_asr(
         self,
@@ -215,28 +342,39 @@ class Pipeline:
         threshold: float,
         pause: bool,
         pending: deque[dict],
-    ) -> bool:
+    ) -> CallOutcome:
         """Send one contiguous audio block; ``pause`` marks a pause-triggered block
-        (its transcript gets a sentence boundary appended). Returns True when the
-        block was queued, False when it was skipped (too short, evicted, no speech)."""
+        (its transcript gets a sentence boundary appended).
+
+        ``BUSY`` means the block was *not* accepted because the worker's backlog
+        is full — the caller must keep its cursor and retry, or that audio (and
+        the text that would have come from it) is lost."""
         if end - start < MIN_BLOCK_S:
-            return False
+            return CallOutcome.SKIPPED
         audio = self.ring.read_since(start)
         if audio is None:
             print(
                 f"[asr] 音频窗口溢出,丢失 {end - start:.1f}s — 重同步",
                 file=sys.stderr,
             )
-            return False
+            return CallOutcome.SKIPPED
+        # Submit exactly the requested window: it may be capped (see
+        # _submit_block) and the ring read always runs to *now*, so without this
+        # the block would carry the samples written since the tick and the next
+        # block would repeat them.
+        span = int((end - start) * SAMPLE_RATE)
+        if span < len(audio):
+            audio = audio[:span]
         if self._speech_fraction(audio, threshold) < MIN_VOICED_FRACTION:
-            return False  # pure silence/noise: not worth a request (and keeps the model quiet)
-        if self.asr_worker.submit(start, end, audio):
-            pending.append({"pause": pause, "pushed": 0})
-            if self.hold_mode:
-                # a new segment: buffer its audio until the utterance ends
-                self.player.set_hold(True)
-            return True
-        return False
+            # pure silence/noise: not worth a request (and keeps the model quiet)
+            return CallOutcome.SKIPPED
+        if not self.asr_worker.submit(start, end, audio):
+            return CallOutcome.BUSY
+        pending.append({"pause": pause, "pushed": 0})
+        if self.hold_mode:
+            # a new segment: buffer its audio until the utterance ends
+            self.player.set_hold(True)
+        return CallOutcome.QUEUED
 
     @staticmethod
     def _speech_fraction(pcm: np.ndarray, threshold: float) -> float:
@@ -288,6 +426,9 @@ class Pipeline:
         # Start every consuming thread BEFORE opening the mic stream: the
         # capture callback (audio thread) writes into the ring immediately,
         # and it must never find a consumer missing.
+        self._install_sigint()
+        if self._stop.is_set():  # stopped before the stream was even opened
+            return
         if self.hold_mode:
             self.player.set_hold(True)  # play only when the segment ended
         self.player.start()
@@ -302,12 +443,16 @@ class Pipeline:
         self._threads = threads
 
         with MicCapture(self.ring, device=self.args.mic_device, gain=self.args.mic_gain):
-            print("running — Ctrl+C to stop")
-            while True:
-                signal.signal(signal.SIGINT, self._request_stop)
-                if self._stop.is_set():
-                    break
+            print("running — Ctrl+C to stop", flush=True)
+            while not self._stop.is_set():
                 time.sleep(0.2)
+        self.shutdown()
+
+    def _install_sigint(self) -> None:
+        """Ctrl+C stops the CLI; a GUI runs this on a worker thread, where
+        signal handlers cannot be installed (and Tk owns the main thread)."""
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._request_stop)
 
     def _request_stop(self, *_):  # noqa: ANN002
         self.shutdown()
@@ -317,6 +462,7 @@ class Pipeline:
             return
         self._stop.set()
         self.asr_worker.stop()
+        self.asr.close()
         self.tts_pool.stop()
         self.player.close_queue()
         self.player.stop()
