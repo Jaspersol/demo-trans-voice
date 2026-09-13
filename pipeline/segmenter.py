@@ -1,53 +1,62 @@
-"""Text buffer and sentence segmenter for the streaming pipeline.
+"""Sentence segmenter for the pause-driven pipeline.
 
-Consumes stable ASR text prefixes and emits complete sentences to the TTS
-stage according to priority rules:
+Text arrives one *sentence block* at a time (the ASR call happenend because the
+speaker paused), so the splitter only has to:
 
-1. Sentence-final punctuation (。！？；.!?) -> emit immediately.
-2. Clause punctuation (，、,:;) -> emit once the buffer reaches ``clause_min_chars``.
-3. No punctuation fallback -> emit at ``hard_max_chars`` on a whitespace boundary.
-4. Idle flush -> emit whatever is buffered after ``idle_flush_ms`` of no new text.
+1. Cut right after a sentence-final mark — ``?!`` kept from the model, plus the
+   ``。`` the pipeline itself appends at a pause (see :func:`normalize_punct`,
+   which downgrades every other model mark to a comma so a mis-predicted period
+   can never split a word in half).
+2. Force a cut at ``max_chars`` (a long, unpunctuated run must not wait forever),
+   preferring the last boundary at or before the limit.
 
 The caller drives two entry points:
-  - :meth:`Segmenter.push` when new stable text arrives.
-  - :meth:`Segmenter.poll` periodically (timeout flush) and before shutdown.
+  - :meth:`Segmenter.push` when transcribed text arrives.
+  - :meth:`Segmenter.flush` when the utterance ends.
 """
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
-# Punctuation that ends a sentence outright.
-SENTENCE_END = "。！？；.!?;…"
-# Punctuation that separates clauses but does not end the sentence.
-CLAUSE_END = "，、,:；"
-# Whitespace/word boundary chars where cutting a long run is least harmful.
+# Marks that end a sentence: `?`/`!` from the model (reliable) plus the `。` this
+# pipeline appends at a pause.
+CUT_PUNCT = "。！？!?…"
+# Marks the model may emit that are downgraded to a comma: they stay as prosody
+# hints for TTS but must never end a sentence (a truncated window makes the
+# model invent them mid-word).
+_SOFTENED = "，、；：,;:" + "。！？!?…"
+# Characters where cutting a long run is least harmful.
 WORD_BOUNDARY = " \t\n\u3000"
+COMMA = "，"
 
-DEFAULTS = {
-    "clause_min_chars": 8,
-    "hard_max_chars": 20,
-    "idle_flush_ms": 800.0,
-}
+DEFAULTS = {"max_chars": 40}
+
+
+def normalize_punct(text: str) -> str:
+    """Keep ``?``/``!``, downgrade everything else to a comma's role.
+
+    Returns the text with ``。、；：`` etc. replaced by ``,`` so the splitter
+    (and TTS) sees a clause break instead of a sentence end. Whitespace runs are
+    collapsed."""
+    out: list[str] = []
+    for ch in text:
+        if ch in "?!！？":
+            out.append(ch)
+        elif ch in _SOFTENED or ch.isspace():
+            if out and out[-1] != COMMA:
+                out.append(COMMA)
+        else:
+            out.append(ch)
+    return "".join(out).strip(COMMA)
 
 
 @dataclass
 class Segmenter:
-    clause_min_chars: int = DEFAULTS["clause_min_chars"]
-    hard_max_chars: int = DEFAULTS["hard_max_chars"]
-    idle_flush_ms: float = DEFAULTS["idle_flush_ms"]
-    split_on_comma: bool = True
-    clock: Callable[[], float] = time.monotonic
+    max_chars: int = DEFAULTS["max_chars"]
 
     _buffer: str = field(default="", init=False)
-    _last_text_at: float = field(default_factory=lambda: 0.0, init=False)
-    _have_text: bool = field(default=False, init=False)
-    _split_on_comma: bool = field(default=True, init=False)
-
-    def __post_init__(self) -> None:
-        self._split_on_comma = self.split_on_comma
 
     # -- state ---------------------------------------------------------------
 
@@ -55,37 +64,26 @@ class Segmenter:
     def buffered(self) -> str:
         return self._buffer
 
-    def reset(self) -> None:
-        """Drop buffered text (e.g. after an ASR rollback)."""
-        self._buffer = ""
-        self._have_text = False
+    @property
+    def empty(self) -> bool:
+        """True when nothing is buffered (all text handed to TTS)."""
+        return not self._buffer
 
     # -- input ---------------------------------------------------------------
 
-    def push(self, stable_text: str) -> list[str]:
-        """Feed newly-stabilized text; return sentences ready for TTS."""
-        self._last_text_at = self.clock()
-        self._have_text = True
-        self._buffer += stable_text
+    def push(self, text: str) -> list[str]:
+        """Feed newly-transcribed text; return sentences ready for TTS."""
+        if not text:
+            return []
+        self._buffer += text
         return self._drain()
 
-    def poll(self) -> list[str]:
-        """Idle/timeout flush; call periodically and at end of speech."""
-        out: list[str] = []
-        if self._buffer and self._have_text:
-            if (self.clock() - self._last_text_at) * 1000.0 >= self.idle_flush_ms:
-                out.append(self._buffer)
-                self._buffer = ""
-                self._have_text = False
-        return out
-
     def flush(self) -> list[str]:
-        """Force out everything buffered (end of utterance / shutdown)."""
+        """Force out everything buffered (utterance end)."""
         out: list[str] = []
         if self._buffer:
             out.append(self._buffer)
             self._buffer = ""
-        self._have_text = False
         return out
 
     # -- internals -----------------------------------------------------------
@@ -104,34 +102,20 @@ class Segmenter:
         """Return the exclusive end index of the next sentence, or None."""
         buf = self._buffer
 
-        # Rule 1: sentence-final punctuation -> cut right after it (including
-        # any run of closing punctuation and trailing whitespace).
+        # Force cut at max_chars, preferring the last boundary at or before it.
+        if len(buf) >= self.max_chars:
+            window = buf[: self.max_chars]
+            for k in range(len(window) - 1, 0, -1):
+                if window[k] in CUT_PUNCT or window[k] in COMMA or window[k] in WORD_BOUNDARY:
+                    return k + 1
+            return self.max_chars
+
+        # Sentence-final mark: cut right after it (swallowing trailing marks and
+        # whitespace).
         for i, ch in enumerate(buf):
-            if ch in SENTENCE_END:
+            if ch in CUT_PUNCT:
                 j = i + 1
-                while j < len(buf) and (buf[j] in SENTENCE_END or buf[j] in WORD_BOUNDARY or buf[j] in '"\'' or buf[j] in "”』)]）」’"):
+                while j < len(buf) and (buf[j] in CUT_PUNCT or buf[j] in WORD_BOUNDARY):
                     j += 1
                 return j
-
-        # Rule 2: comma cut, only when enabled and chunk >= clause_min_chars.
-        if self._split_on_comma:
-            for i, ch in enumerate(buf):
-                if ch in CLAUSE_END and i + 1 >= self.clause_min_chars:
-                    return i + 1
-
-        # Rule 3: hard limit on an unbroken run -> cut at the last word
-        # boundary, else mid-run.
-        if len(buf) >= self.hard_max_chars:
-            window = buf[: self.hard_max_chars]
-            for k in range(len(window) - 1, 0, -1):
-                if window[k] in WORD_BOUNDARY:
-                    return k + 1
-            return self.hard_max_chars
-
         return None
-
-    # convenience: iterate sentences as they arrive from a text stream
-    def consume(self, chunks: Iterator[str]) -> Iterator[str]:
-        for chunk in chunks:
-            yield from self.push(chunk)
-        yield from self.flush()

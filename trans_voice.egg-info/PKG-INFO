@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: trans-voice
+Version: 0.1.0
+Summary: Real-time ASR->TTS pause-driven voice pipeline
+Requires-Python: >=3.11
+Requires-Dist: numpy>=2.0
+Requires-Dist: sounddevice>=0.5
+Requires-Dist: soundfile>=0.13
+Requires-Dist: httpx>=0.28

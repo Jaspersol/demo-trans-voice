@@ -1,8 +1,14 @@
-"""Streaming ASR client for llama-server (Qwen3-ASR GGUF).
+"""ASR worker thread for llama-server (Qwen3-ASR GGUF).
 
-Sends the trailing window of captured audio to ``POST /v1/chat/completions``
-with ``stream: true`` and yields text deltas via SSE. Works with both the
-final JSON result and streaming deltas.
+Decouples the blocking ``POST /v1/chat/completions`` call from the pipeline's
+slow loop: the loop snapshots the audio window, stamps it with cursor times,
+and enqueues it; a dedicated worker transcribes and delivers ``(snapshot_end,
+text)``. The slow loop never stalls on network/decode latency, so the ring
+cursor stays current and a slow server can no longer overflow the buffer.
+
+Streaming: SSE deltas arrive while the model still decodes, so the server's
+transcription overlaps the next encode. Delta semantics are batch-equivalent:
+one text result per window.
 
 Known llama.cpp quirk (issue #26749): the model emits a
 ``language XXXX<asr_text>`` metadata prefix that the server does not strip;
@@ -15,7 +21,11 @@ import base64
 import io
 import json
 import re
+import threading
+import time
 from collections.abc import Iterator
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 import httpx
 import numpy as np
@@ -23,9 +33,81 @@ import soundfile as sf
 
 METADATA_RE = re.compile(r"language\s+\S+?<asr_text>\s*")
 
+READ_TIMEOUT_S = 3.0
+
 
 def strip_metadata(text: str) -> str:
     return METADATA_RE.sub("", text)
+
+
+# punctuation/whitespace ignored when matching a re-stated overlap (the model
+# re-transcribes the context audio with slightly different punctuation)
+_NOISE_CHARS = set("，。！？；：、,.!?;:… \t\n\u3000\"'”』)]）」’")
+MIN_OVERLAP = 4          # normalized chars: smallest exact re-statement we trust
+FUZZY_MIN_OVERLAP = 4    # normalized chars: smallest drifted alignment we trust
+
+
+def normalize_text(text: str) -> str:
+    """Drop punctuation/whitespace — the form used for all overlap matching."""
+    return "".join(c for c in text if c not in _NOISE_CHARS)
+
+
+def strip_overlap(known: str, text: str) -> str:
+    """Cut ``text`` where the already-handled text (``known``) ends.
+
+    Each ASR window carries ``asr_context_seconds`` of already-transcribed
+    audio, so the model re-emits that older audio — and because the window
+    start moves (``ctx_start = cursor - context``) while the cursor also jumps
+    forward on a silence commit, the re-stated part is *not* always at the head
+    of the answer: the head can correspond to audio older than the end of what
+    we already fed. Assuming "answer head == fed tail" therefore misses the
+    overlap and the same sentence gets fed (and spoken) twice.
+
+    Instead, align the *end* of ``known`` inside ``text`` (exact matches first,
+    then fuzzy, punctuation/whitespace-insensitive) and cut right after the
+    aligned position. Returns ``text`` unchanged when the answer carries no
+    recognisable re-statement (and ``""`` when it is one entirely)."""
+    known_norm = normalize_text(known)
+    text_norm = normalize_text(text)
+    if not known_norm or not text_norm:
+        return text
+
+    def cut_at_norm(index: int) -> str:
+        """Drop the first ``index`` normalized chars of ``text``."""
+        if index <= 0:
+            return text
+        seen = 0
+        for i, ch in enumerate(text):
+            if ch not in _NOISE_CHARS:
+                seen += 1
+                if seen == index:
+                    return text[i + 1:].lstrip("".join(_NOISE_CHARS))
+        return ""
+
+    # the answer is nothing but a re-statement of what we already have
+    if text_norm == known_norm[-len(text_norm):]:
+        return ""
+
+    # exact: longest tail of `known` that occurs in `text`; cut after it
+    for size in range(min(len(known_norm), len(text_norm)), MIN_OVERLAP - 1, -1):
+        pos = text_norm.find(known_norm[-size:])
+        if pos >= 0:
+            return cut_at_norm(pos + size)
+
+    # fuzzy: align `known` against `text` and cut after the block that gets
+    # furthest into `known` — the tail may have drifted by a character or two,
+    # so a block reaching within 2 chars of the end still marks the boundary
+    threshold = min(FUZZY_MIN_OVERLAP, len(known_norm))
+    furthest_end = -1  # progress in known
+    cut = 0            # corresponding progress in text
+    for block in SequenceMatcher(None, known_norm, text_norm, autojunk=False).get_matching_blocks():
+        if block.size and block.size >= threshold and block.a + block.size >= len(known_norm) - 2:
+            if block.a + block.size > furthest_end:
+                furthest_end = block.a + block.size
+                cut = block.b + block.size
+    if furthest_end >= 0:
+        return cut_at_norm(cut)
+    return text
 
 
 def wav_base64(pcm: np.ndarray, sample_rate: int = 16_000) -> str:
@@ -34,18 +116,44 @@ def wav_base64(pcm: np.ndarray, sample_rate: int = 16_000) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+@dataclass
+class AsrRequest:
+    """One snapshot window queued for transcription."""
+
+    window_start: float  # stream-seconds where this snapshot begins
+    window_end: float    # stream-seconds where it ends (= caller's cursor)
+    pcm: np.ndarray
+
+
+
+@dataclass
+class AsrResult:
+    window_start: float
+    window_end: float
+    text: str
+    partial: bool = False  # True: the window is still being transcribed
+
+
 class AsrClient:
+    """SSE transcription request for llama-server."""
+
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:8081",
         model: str = "qwen3-asr",
         language: str | None = None,
-        timeout: float = 30.0,
+        connect_timeout: float = 2.0,
+        read_timeout: float = READ_TIMEOUT_S,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.language = language
-        self._client = httpx.Client(timeout=timeout)
+        # A hung server must freeze the pipeline for connect only, not for a
+        # global 30 s: connect failure is a fast error; decode may legitimately
+        # take seconds on long windows. Read timeout stays short: a stalled
+        # window is retried whole, blocking the loop for 10 s used to overflow
+        # the ring buffer and drop up to its full capacity of speech.
+        self._client = httpx.Client(timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30.0, pool=2.0))
 
     def _messages(self, audio_b64: str) -> list[dict]:
         content: list[dict] = [
@@ -77,7 +185,7 @@ class AsrClient:
             yield from _sse_content_deltas(resp.iter_lines())
 
     def transcribe(self, pcm: np.ndarray, sample_rate: int = 16_000) -> str:
-        """Non-streaming convenience call; returns final text."""
+        """Non-streaming transcription; returns final text."""
         payload = {
             "model": self.model,
             "messages": self._messages(wav_base64(pcm, sample_rate)),
@@ -104,3 +212,128 @@ def _sse_content_deltas(lines: Iterator[str | bytes]) -> Iterator[str]:
         text = delta.get("content")
         if text:
             yield text
+
+
+class AsrWorker:
+    """Single transcription thread with a snapshot queue and a result pipe.
+
+    The caller (slow loop) submits immutable audio snapshots; the worker
+    transcribes them in submission order and emits results via :meth:`results`.
+    The loop never blocks on the network, so the ring cursor stays current and
+    slow ASR requests can no longer overflow the capture ring.
+
+    ``stream=True`` publishes the accumulating text of a window as
+    ``partial=True`` results (throttled to ``emit_ms``), so segmentation and
+    TTS can start before the window finishes; the window's completion is
+    signalled by a final ``partial=False`` result. ``stream=False`` performs a
+    single batch request and publishes exactly one final result per window."""
+
+    def __init__(
+        self,
+        client: AsrClient,
+        max_backlog: int = 3,
+        stream: bool = True,
+        emit_ms: float = 200.0,
+    ) -> None:
+        self._client = client
+        self._jobs: list[AsrRequest] = []  # bounded, max_backlog snapshots
+        self._results: list[AsrResult] = []  # completed, in submission order
+        self._max_backlog = max_backlog
+        self._busy = False  # a request is in flight
+        self._stream = stream
+        self._emit_s = max(emit_ms, 0.0) / 1000.0
+        self._stop = threading.Event()
+        self._wake = threading.Condition()  # guards jobs/results/busy
+        self._thread: threading.Thread | None = None
+
+    @property
+    def busy(self) -> bool:
+        """True while a request is in flight or snapshots are still queued:
+        the caller uses this to know ASR still has text to produce."""
+        with self._wake:
+            return self._busy or bool(self._jobs)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="asr-worker", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._wake:
+            self._wake.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def pending(self) -> int:
+        """Queued-but-unstarted snapshots."""
+        with self._wake:
+            return len(self._jobs)
+
+    def submit(self, window_start: float, window_end: float, pcm: np.ndarray) -> bool:
+        """Queue a snapshot window. Returns False when the worker is busy and
+        the backlog cap is hit (the caller should skip this tick; the next one
+        covers the audio via cursor-never-regression)."""
+        with self._wake:
+            if self._busy and len(self._jobs) >= self._max_backlog:
+                return False
+            self._jobs.append(AsrRequest(window_start=window_start, window_end=window_end, pcm=pcm))
+            self._wake.notify_all()
+        return True
+
+    def results(self) -> list[AsrResult]:
+        """Drain completed results in submission order."""
+        with self._wake:
+            out = self._results
+            self._results = []
+            return out
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._wake:
+                while not self._jobs and not self._stop.is_set():
+                    self._wake.wait(timeout=0.2)
+                if self._stop.is_set() and not self._jobs:
+                    return
+                job = self._jobs.pop(0)
+                self._busy = True
+            try:
+                if self._stream:
+                    self._transcribe_streaming(job)
+                else:
+                    text = strip_metadata(self._client.transcribe(job.pcm)).strip()
+                    self._publish(job, text, partial=False)
+            except Exception:
+                # failed snapshot: report an empty result carrying its window
+                # so the caller keeps its cursor/interval logic
+                self._publish(job, "", partial=False)
+
+    def _transcribe_streaming(self, job: AsrRequest) -> None:
+        """Publish the growing text of one window as partial results."""
+        seen = ""
+        emitted_at = 0.0
+        for delta in self._client.transcribe_stream(job.pcm):
+            seen += delta
+            now = time.monotonic()
+            if self._emit_s and now - emitted_at < self._emit_s:
+                continue
+            emitted_at = now
+            # strip_metadata also inside a window: the model may prefix its
+            # first delta with the language metadata line
+            text = strip_metadata(seen).strip()
+            if text:
+                self._publish(job, text, partial=True)
+        self._publish(job, strip_metadata(seen).strip(), partial=False)
+
+    def _publish(self, job: AsrRequest, text: str, partial: bool) -> None:
+        with self._wake:
+            self._results.append(
+                AsrResult(
+                    window_start=job.window_start,
+                    window_end=job.window_end,
+                    text=text,
+                    partial=partial,
+                )
+            )
+            if not partial:
+                self._busy = False
+            self._wake.notify_all()

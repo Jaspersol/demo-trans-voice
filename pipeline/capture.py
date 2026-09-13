@@ -47,7 +47,6 @@ class RingBuffer:
                 self._buf[self._write:] = samples[:first]
                 self._buf[: end - self._cap] = samples[first:]
             self._write = end % self._cap
-            self._filled = min(self._filled + n, self._cap)
             self._total += n
             self._filled = min(self._filled + n, self._cap)
 

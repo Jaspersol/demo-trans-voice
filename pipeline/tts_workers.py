@@ -4,8 +4,9 @@ Requires the TTS-enabled llama-server image (llama.cpp PR #26603,
 ``llama-cuda-tts:local``). The model is resident in VRAM; each request streams
 raw float32 PCM as frames are generated (``stream: true``), so playback can
 start before synthesis finishes. Chunks are handed to the AudioPlayer under a
-single seq with ``final=True`` on the last chunk; the player orders segments
-and overlaps N+1's synthesis with N's playback.
+single seq with ``final=True`` on the last chunk; the player plays segments
+in seq order, starting each as soon as its first chunk arrives. Jobs are
+processed in order (workers=1 serial), so playback order always matches.
 """
 
 from __future__ import annotations
@@ -17,8 +18,6 @@ import httpx
 import numpy as np
 
 from pipeline.playback import AudioPlayer
-
-_RATE_RE = None  # Content-Type parsing not needed; server emits 24 kHz float32
 
 
 class TtsWorkerPool:
@@ -47,13 +46,23 @@ class TtsWorkerPool:
         self._seq_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._active = 0          # synthesis jobs currently in flight
+        self._active_lock = threading.Lock()
 
     def submit(self, sentence: str) -> int:
         with self._seq_lock:
             seq = self._seq
             self._seq += 1
+        with self._active_lock:
+            self._active += 1
         self._jobs.put((seq, sentence))
         return seq
+
+    @property
+    def busy(self) -> bool:
+        """True while any synthesis job is still in flight."""
+        with self._active_lock:
+            return self._active > 0
 
     def start(self) -> None:
         for i in range(self._workers):
@@ -109,3 +118,10 @@ class TtsWorkerPool:
                 self._synthesize(seq, sentence)
             except Exception as e:
                 print(f"[tts] {sentence!r} failed: {e}")
+                # tombstone: the player must see a final (empty) segment for
+                # this seq, otherwise it stalls on reorder and drags every
+                # later sentence down with it
+                self._player.put(seq, np.zeros(0, dtype=np.float32), 24_000, final=True)
+            finally:
+                with self._active_lock:
+                    self._active -= 1

@@ -1,0 +1,2 @@
+[console_scripts]
+trans-voice = pipeline.app:main

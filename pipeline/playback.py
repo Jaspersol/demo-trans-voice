@@ -1,21 +1,19 @@
 """Sequenced playback of whole-utterance TTS segments.
 
-Producers (one per TTS synthesis job) push *complete* utterances as
-``(seq, np.float32 array, sample_rate)`` via :meth:`AudioPlayer.put`. Because
-synthesis jobs run in parallel, segments can arrive out of order: the player
-buffers early segments and waits up to ``reorder_timeout_ms`` for a missing
-segment, then skips ahead (latency over completeness).
+Producers push segments as ``(seq, np.float32 array, sample_rate)`` via
+:meth:`AudioPlayer.put`. With the single serial synthesis worker segments
+arrive strictly in order; the player blocks until segment ``next_seq`` is
+complete (a failed synthesis job lands an empty tombstone, so nothing
+blocks forever) and plays segments one by one.
 """
 
 from __future__ import annotations
 
-import queue
 import threading
+import time
 from collections.abc import Callable
 
 import numpy as np
-
-from pipeline.capture import _normalize_name
 
 DEFAULT_GAP_MS = 60.0
 
@@ -34,7 +32,6 @@ class AudioPlayer:
         device: int | str | None = None,
         gap_ms: float = DEFAULT_GAP_MS,
         channels: int = 1,
-        reorder_timeout_ms: float = 3000.0,
     ) -> None:
         import sounddevice as sd
 
@@ -42,7 +39,6 @@ class AudioPlayer:
         self._device = device
         self._gap_ms = gap_ms
         self._channels = channels
-        self._reorder_timeout = reorder_timeout_ms / 1000.0
         self._pending: dict[int, dict] = {}  # seq -> {"rate": int, "chunks": [np.ndarray], "done": bool}
         self._next_seq = 0
         self._cv = threading.Condition()
@@ -50,6 +46,46 @@ class AudioPlayer:
         self._stream = None
         self._opened_rate = 24_000
         self._stop = threading.Event()
+        self._hold = False  # True: buffer segments, do not play them yet
+        self._playing = False  # True while an utterance is being written out
+        self._busy_until = 0.0  # monotonic time until which playback still sounds
+        self._drain_ms = 400.0  # device buffer drain hold-off after last write
+
+    def set_drain_ms(self, ms: float) -> None:
+        """Extra hold-off after the last PCM write during which is_playing
+        stays True (covers sound-card buffer drain time)."""
+        self._drain_ms = ms
+
+    def set_hold(self, hold: bool) -> None:
+        """Hold (or release) buffered playback: while held, completed segments
+        stay in the pool and the playback thread writes nothing."""
+        with self._cv:
+            self._hold = hold
+            if not hold:
+                self._cv.notify_all()
+
+    def release(self) -> None:
+        """Start playing whatever is buffered (idempotent)."""
+        self.set_hold(False)
+
+    @property
+    def hold(self) -> bool:
+        """True while playback is still held for the current round."""
+        with self._cv:
+            return self._hold
+
+    @property
+    def pending_audio(self) -> bool:
+        """True when a segment is buffered and not yet played."""
+        with self._cv:
+            return bool(self._pending)
+
+    @property
+    def is_playing(self) -> bool:
+        """True while TTS audio is actively sounding or queued to sound:
+        covers the write phase AND a drain window after the last write
+        (device-buffer latency means sound outlives the write call)."""
+        return self._playing or time.monotonic() < self._busy_until
 
     def put(self, seq: int, pcm: np.ndarray, rate: int, final: bool = False) -> None:
         """Deliver one chunk of segment ``seq``. Chunks must arrive in order
@@ -63,12 +99,6 @@ class AudioPlayer:
                 seg["done"] = True
             self._cv.notify()
 
-    def cancel_before(self, seq: int) -> None:
-        """Drop all pending segments with sequence < seq (user stopped talking
-        and stale utterances must not be spoken)."""
-        with self._cv:
-            for k in [k for k in self._pending if k < seq]:
-                del self._pending[k]
 
     def close_queue(self) -> None:
         with self._cv:
@@ -105,16 +135,18 @@ class AudioPlayer:
             blocksize=0,  # let PortAudio pick low-latency
         )
         stream.start()
-        self._stream = stream
         return stream
 
     def _run(self) -> None:
         while not self._stop.is_set():
             item = self._next_ready()
             if item is None:
+                with self._cv:
+                    self._playing = bool(self._pending)
                 continue
             seq, seg = item
             rate = seg["rate"]
+            self._playing = True
             stream = self._ensure_stream(rate)
             try:
                 for pcm in seg["chunks"]:
@@ -122,37 +154,40 @@ class AudioPlayer:
                 gap = int(self._gap_ms / 1000.0 * rate)
                 if gap > 0:
                     stream.write(np.zeros((gap, self._channels), dtype=np.float32))
+                # stream.write() blocks until the data is in the device
+                # buffer, so the segment has already been sounding *while*
+                # it was written: only the buffer's residual audio remains
+                # after the loop. Adding written/rate here kept the gate
+                # closed for the whole segment length after it had ended.
+                self._busy_until = time.monotonic() + self._drain_ms / 1000.0
             except Exception:
                 pass
             finally:
                 with self._cv:
                     self._next_seq = seq + 1
                     self._pending.pop(seq, None)
+                    self._playing = bool(self._pending)
 
     def _next_ready(self):
-        """Wait for completed segment ``next_seq``; on timeout skip to the
-        lowest available sequence (a failed synthesis job must not stall)."""
-        deadline = self._reorder_timeout
+        """Wait for completed segment ``next_seq``. Segments arrive strictly
+        in order (single serial synthesis worker) and every seq eventually
+        gets a final chunk — a synthesis failure lands an empty tombstone —
+        so no reorder-skip: just block until ``next_seq`` is done. Stale
+        (lower-seq) leftovers are dropped defensively.
+
+        While ``_hold`` is set nothing is returned: synthesis keeps filling
+        the pool, playback waits for the caller's release."""
         with self._cv:
             while not self._stop.is_set():
+                if self._hold:
+                    self._cv.wait(timeout=0.2)
+                    continue
+                # stale leftovers first
+                for s in [k for k in self._pending if k < self._next_seq]:
+                    self._pending.pop(s, None)
                 seg = self._pending.get(self._next_seq)
                 if seg is not None and seg["done"]:
                     return self._next_seq, seg
-                if self._pending:
-                    lowest = min(self._pending)
-                    if lowest == self._next_seq:
-                        # in-flight segment, not done yet: wait for its final chunk
-                        if not self._cv.wait_for(lambda: self._pending.get(self._next_seq, {}).get("done") or self._stop.is_set(), timeout=deadline):
-                            self._next_seq = lowest + 1  # give up on it
-                        continue
-                    if lowest > self._next_seq:
-                        if not self._cv.wait_for(lambda: (self._next_seq in self._pending and self._pending[self._next_seq]["done"]) or self._stop.is_set(), timeout=deadline):
-                            self._next_seq = lowest
-                            continue
-                        continue
-                    # lowest < next_seq: stale, drop it
-                    self._pending.pop(lowest)
-                    continue
                 self._cv.wait(timeout=0.2)
         return None
 

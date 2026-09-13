@@ -1,0 +1,15 @@
+pyproject.toml
+pipeline/__init__.py
+pipeline/app.py
+pipeline/asr_client.py
+pipeline/capture.py
+pipeline/config.py
+pipeline/playback.py
+pipeline/segmenter.py
+pipeline/tts_workers.py
+trans_voice.egg-info/PKG-INFO
+trans_voice.egg-info/SOURCES.txt
+trans_voice.egg-info/dependency_links.txt
+trans_voice.egg-info/entry_points.txt
+trans_voice.egg-info/requires.txt
+trans_voice.egg-info/top_level.txt
