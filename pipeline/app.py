@@ -125,6 +125,7 @@ class Pipeline:
         quiet_since: float | None = None
         pending: deque[dict] = deque()  # per submitted block: {pause, pushed}
         gated = False       # speaker output: playing, so stop listening
+        gated_speech = False  # speech arrived while gated: it is skipped
         ambient_log_at = time.monotonic() + 1.0
 
         while not self._stop.is_set():
@@ -174,10 +175,22 @@ class Pipeline:
 
             if mute and gated:
                 if not self._playback_drained(pending):
+                    # Voice over the playback is dropped on purpose (the mic
+                    # would otherwise transcribe our own TTS), but say so: a
+                    # silent drop reads exactly like a dead pipeline.
+                    if not quiet:
+                        gated_speech = True
                     # Small slices: playback can end mid-interval and the gate
                     # must reopen as soon as the audio is done.
                     self._stop.wait(min(interval, IDLE_POLL_S))
                     continue
+                if gated_speech:
+                    print(
+                        f"[asr] 外放停听: 播放期间跳过 {now_s - block_start:.1f}s 音频"
+                        f"（含语音；播放期不转写自己的 TTS）",
+                        flush=True,
+                    )
+                gated_speech = False
                 # playback over: skip the played span (our own TTS, plus whatever
                 # the speaker said over it), resume immediately
                 block_start = now_s
@@ -195,6 +208,16 @@ class Pipeline:
                 # measured here. Compensating keeps the two gap settings meaning
                 # "the pause you actually make".
                 silence_ms = (now_t - quiet_since) * 1000.0 + SILENCE_OFFSET_MS
+                # Nothing awake and nothing owed: the audio still behind the
+                # cursor is silence only (`dirty` clears at the segment end,
+                # which pins the cursor to that instant), so drop it. Left
+                # alone, a pause longer than the ring ages the cursor out and
+                # the next call reports a backlog loss that never happened —
+                # and ships a full window of mostly silence, whose SKIPPED
+                # verdict then throws away the speech the new utterance had
+                # already started with.
+                if not dirty and held_pause is None and not leftover:
+                    block_start = now_s
             else:
                 quiet_since = None
                 called = False
@@ -274,8 +297,12 @@ class Pipeline:
                     quiet_since = None
                     called = False
 
-            if ambient_log_at and now_t >= ambient_log_at:
-                # informational: gives a number to calibrate silence_threshold
+            if quiet and ambient_log_at and now_t >= ambient_log_at:
+                # informational: gives a number to calibrate silence_threshold.
+                # Sampled on a quiet tick on purpose: taken unconditionally it
+                # lands inside the user's first sentence, reports *speech* as
+                # the noise floor and tells them to raise the threshold above
+                # their own voice — after which nothing is ever detected again.
                 ambient = self.ring.energy(0.5)
                 print(
                     f"[asr] 环境RMS≈{ambient:.5f} 门限={threshold:g}"

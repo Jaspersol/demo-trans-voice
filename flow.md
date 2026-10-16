@@ -3,6 +3,7 @@
 > 代码基线：`pipeline/`（app.py、capture.py、asr_client.py、segmenter.py、tts_workers.py、playback.py、config.py、gui.py、tray.py）+ `config.ini` + `Dockerfile.tts` + `trans-voice.spec`。
 > 一句话：麦克风 → 环形缓冲 → **按停顿切块** 调用 ASR（流式=一句一块 / 批式=整段一块）→ 标点归一化 → 切句 → TTS worker 流式 PCM → 顺序播放；外放时说话期间只合成不播、播放期间停听。
 > 与旧版的根本差别：**没有滑动窗口、没有上下文重叠、没有去重/回滚**。每段音频只转写一次，块边界落在停顿里，所以模型永远看不到被截断的词，也不会重复输出。
+> 专题文档：`batch-speaker.md` —— 展开四象限中 `asr_stream=false` + `mute_during_tts=true`（非流式 + 外放）的完整策略、状态机与边界情况。
 
 ---
 
@@ -70,6 +71,7 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
 - **批式（`asr_stream=false`）**：G1 不参与；**G2** 到达时发一次非流式整段请求（`transcribe()`），之后同一套切句/播放逻辑。两种模式的"语段结束"是同一个绝对阈值。
 - `dirty` 标志：有声即置位，语段结束清除。它防止静默持续时反复触发"语段结束"，同时保证批式首次 G2 能生效。
 - 判定点实测（说话 0–1.0 s，G1=450 ms、G2=1200 ms）：流式 1.46 s 提交该句、**2.21 s** 判段结束（= 说话结束 + G2）；批式 2.21 s 提交整段并同时判段结束 —— 两个模式的段结束是同一个绝对阈值。
+- **游标只停在有声处**：静默且无欠账（`dirty=False`、无 `held_pause` 重试、无 `leftover`）时 `block_start = now_s`。语义是"环里尚未提交的那段只剩静音，直接丢掉"。没有这条，一个长停顿就会把游标留在环容量之外，下一次调用误报 `积压:丢弃最早 Xs`，而且那块窗口（9 s）几乎全是静音：`SKIPPED` 之后 `block_start` 跳到 `now_s`，新句开头已经说出的那截音频被一并丢掉。`dirty` 在语段结束（G2 flush）时才清，而那一刻游标正好被钉在 `now_s`，所以"静默 + `dirty=False`"恰好等价于"尚未提交的都是静音"。
 - 长句兜底：有声且 `ring.seconds - block_start >= window_seconds`（或上次提交被窗口上限截断、`leftover` 为真）→ 强制提交一块（`pause=False`，不补句号）。
 - 轮询：有声用 `asr_interval_ms`；静默固定 50 ms（`IDLE_POLL_S`，不设配置项——停顿计时就按这个节拍采样，调大等于把 450 ms 的句间停顿吞掉；单次 `energy(0.05)` 实测 3.6 µs，省不出东西）。
 
@@ -149,6 +151,7 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
   `not pending`（没有已提交未吸收的块）**且** `not is_playing` **且** `not pending_audio` **且** `sentences.empty()` **且** `segmenter.empty` **且** `not tts_pool.busy` **且** `not asr_worker.busy`。
   满足 → `block_start = now_s`（跳过播放期音频，不把自己的 TTS 转写回来）、`quiet_since = None`、`called = False`、`gated = False`，**立即恢复收听**（不额外等待）。
   门控成立时刻 = **最后一段 PCM 写完 + `_drain_ms`(400 ms) + ≤50 ms 轮询**：`stream.write()` 是阻塞写，写循环返回时该段已经播完，只剩声卡缓冲里的残响（400 ms 是保守余量，`AudioPlayer.set_drain_ms()` 可调）。门控期间用小片轮询（`min(asr_interval_ms, 50 ms)`），播放一结束就恢复，不再等满一个节拍。
+  停听期间麦克风照收，但那一段（含用户压着 TTS 说的话）在恢复时被 `block_start = now_s` 一次丢掉；只要停听期间出现过有声拍，恢复时就打一行 `[asr] 外放停听: 播放期间跳过 X.Xs 音频（含语音；播放期不转写自己的 TTS）`。没有这行，被丢掉的语音在日志里和"流水线死了"完全一样（播放多久就静音多久、一行不吐）。
 - `mute_during_tts=false`：播放器未上锁，合成一块播一块；门控分支完全不进（`pending_audio` 也不参与判空）。
 
 ---
@@ -180,10 +183,11 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
 ## 9. 延迟与鲁棒性速查
 
 - **不重叠、不重复**：块边界在停顿内，无上下文音频、无窗口重叠，所以不需要去重/回滚；模型复述同一句的可能性只来自它自己。
-- **不丢音频**：只有 `QUEUED`/`SKIPPED` 才推进 `block_start`；`BUSY` 时游标不动、下一拍重试（`held_pause` 记住原块的 `pause`，所以强制长句块重试后不会被补句号）；批式在段末被拒时同样不 flush、不 release，重试成功才结束这一段；单块窗口上限 = 环容量 − 1 s（`_submit_block`），积压只会把音频切成连续块，不会撑爆环；游标真被环挤掉时丢头保尾（保留最近 ~9 s）并打印 `[asr] 积压:丢弃最早 Xs…`。环容量 `window_seconds + 2.0`。
+- **不丢音频**：只有 `QUEUED`/`SKIPPED` 才推进 `block_start`；`BUSY` 时游标不动、下一拍重试（`held_pause` 记住原块的 `pause`，所以强制长句块重试后不会被补句号）；批式在段末被拒时同样不 flush、不 release，重试成功才结束这一段；单块窗口上限 = 环容量 − 1 s（`_submit_block`），积压只会把音频切成连续块，不会撑爆环；游标真被环挤掉时丢头保尾（保留最近 ~9 s）并打印 `[asr] 积压:丢弃最早 Xs…`。静默期游标同步前移到 `now_s`（§3），所以 `积压` 行只在真正的 jam（说话期间 ASR 已经落后于实时、音频真的被环挤掉）出现。环容量 `window_seconds + 2.0`。
 - **防噪声/瞬态**：`MIN_BLOCK_S=0.3` + 20 ms 帧语音占比 `MIN_VOICED_FRACTION=0.15` + `silence_threshold` 固定门限（无 EMA，不会把持续说话判成静音；代价是换环境要重新标定一个数）。
+- **标定那行是安静时取的**：`[asr] 环境RMS≈…` 只在第一个静默拍上采样（此前无条件采样，启动后 1 s 那 0.5 s 往往落在用户已经开口的说话电平上：把"底噪"报成 0.1 并劝你把门限提到 0.2~0.3，照做之后语音再也过不了门限 —— 症状是"不转写、也没有任何日志"，和流水线死掉无法区分）。
 - **短停顿不碎句**：只有停顿 ≥ `sentence_gap_ms` 才触发调用；`max_split_chars` 只对"无标点长句"兜底。
-- **外放不自听**：hold 期间 `is_playing=False`（不误触发停听）；释放后播放期 `gated` 锁存并跳游标；`_playback_drained(pending)` **七条件**全清才恢复（比流式多一条：**没有已提交但尚未吸收的 ASR 块**）。这条对批式是必需的：段末才发请求，请求在途、以及"结果已 publish 但还没被主循环吸收"的那个 tick 里，其余六个信号全都看起来是空闲的——少了它，门控会提前打开，播放期间的 TTS 回灌音频被当成说话提交（自我听写）。
+- **外放不自听**：hold 期间 `is_playing=False`（不误触发停听）；释放后播放期 `gated` 锁存并跳游标；`_playback_drained(pending)` **七条件**全清才恢复（比流式多一条：**没有已提交但尚未吸收的 ASR 块**）。这条对批式是必需的：段末才发请求，请求在途、以及"结果已 publish 但还没被主循环吸收"的那个 tick 里，其余六个信号全都看起来是空闲的——少了它，门控会提前打开，播放期间的 TTS 回灌音频被当成说话提交（自我听写）。停听期间只要出现过有声拍，恢复时就打一行 `[asr] 外放停听: 播放期间跳过 X.Xs 音频（含语音…）` —— 丢掉的内容必须看得见。
 - **TTS 不卡死**：每段必发 `final`；失败发零长度墓碑段，后续段照常播。
 - **四象限正交**：`asr_stream` 只切 ASR 请求模式；`mute_during_tts` 只切"缓冲播放 + 播放期停听"；TTS 恒为流式 PCM。
 - **省资源**：能量低于门限直接跳过快照（不读快照、不发请求）；静默期固定 50 ms 采样（见 §3），实测 `energy(0.05)` 3.6 µs/次 ≈ 20 Hz 下 0.007% CPU，所以没有「静默轮询间隔」这个配置项。
