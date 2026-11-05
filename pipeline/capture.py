@@ -32,7 +32,7 @@ class RingBuffer:
         n = len(samples)
         if n >= self._cap:
             with self._lock:
-                self._buf[:] = samples[-self._cap:]
+                self._buf[:] = samples[-self._cap :]
                 self._write = 0
                 self._filled = self._cap
                 self._total += n
@@ -40,10 +40,10 @@ class RingBuffer:
         with self._lock:
             end = self._write + n
             if end <= self._cap:
-                self._buf[self._write:end] = samples
+                self._buf[self._write : end] = samples
             else:
                 first = self._cap - self._write
-                self._buf[self._write:] = samples[:first]
+                self._buf[self._write :] = samples[:first]
                 self._buf[: end - self._cap] = samples[first:]
             self._write = end % self._cap
             self._total += n
@@ -55,10 +55,14 @@ class RingBuffer:
             n = min(int(seconds * SAMPLE_RATE), self._filled)
             if n == 0:
                 return np.zeros(0, dtype=np.float32)
-            start = (self._write - n) % self._cap
-            if start + n <= self._cap:
-                return self._buf[start : start + n].copy()
-            return np.concatenate([self._buf[start:], self._buf[: start + n - self._cap]])
+            return self._slice((self._write - n) % self._cap, n)
+
+    def _slice(self, start: int, n: int) -> np.ndarray:
+        """Copy ``n`` samples starting at ring index ``start``, joining the two
+        pieces when the window wraps past the buffer end. Caller holds the lock."""
+        if start + n <= self._cap:
+            return self._buf[start : start + n].copy()
+        return np.concatenate([self._buf[start:], self._buf[: start + n - self._cap]])
 
     @property
     def capacity_seconds(self) -> float:
@@ -84,10 +88,7 @@ class RingBuffer:
                 return np.zeros(0, dtype=np.float32)
             if n > self._filled:  # requested audio has been evicted
                 return None
-            start = (self._write - n) % self._cap
-            if start + n <= self._cap:
-                return self._buf[start : start + n].copy()
-            return np.concatenate([self._buf[start:], self._buf[: start + n - self._cap]])
+            return self._slice((self._write - n) % self._cap, n)
 
     def energy(self, seconds: float = 1.0) -> float:
         chunk = self.read_last(seconds)
@@ -96,10 +97,10 @@ class RingBuffer:
         return float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
 
 
-
 def _normalize_name(name: str) -> str:
+    """Comparison key for device names: lowercased, whitespace removed (Windows
+    lists one driver several times as ``Realtek(R) Audio``/``Realtek(R)Audio``)."""
     return "".join(str(name).lower().split())
-
 
 
 class MicCapture:
@@ -157,7 +158,7 @@ class MicCapture:
             np.clip(mono, -1.0, 1.0, out=mono)
         self.ring.write(mono)
 
-    def __enter__(self) -> "MicCapture":
+    def __enter__(self) -> MicCapture:
         self._stream.start()
         return self
 

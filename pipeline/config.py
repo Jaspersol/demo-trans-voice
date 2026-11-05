@@ -228,29 +228,102 @@ def parse_args_with_config(argv: list[str] | None = None) -> argparse.Namespace:
     cfg = load_config(config_path)
 
     p = argparse.ArgumentParser(description="Real-time ASR->TTS voice pipeline")
-    p.add_argument("-c", "--config", default=None, help=f"config file (default: {DEFAULT_CONFIG_PATH} if present)")
+    p.add_argument(
+        "-c",
+        "--config",
+        default=None,
+        help=f"config file (default: {DEFAULT_CONFIG_PATH} if present)",
+    )
     p.add_argument("--asr-url", default=None, help="ASR llama-server base URL")
     p.add_argument("--asr-model", default=None, help="ASR model name for API payload")
     p.add_argument("--language", default=None, help="prefill language hint for ASR")
     p.add_argument("--tts-url", default=None, help="tts-wrapper base URL")
     p.add_argument("--tts-workers", type=int, default=None)
     p.add_argument("--tts-lang", default=None)
-    p.add_argument("--speaker-ref", default=None, help="3s reference wav for voice cloning (local path)")
+    p.add_argument(
+        "--speaker-ref",
+        default=None,
+        help="3s reference wav for voice cloning (local path)",
+    )
     p.add_argument("--mic-device", default=None, help="input device index/name")
     p.add_argument("--mic-gain", type=float, default=None, help="software mic gain multiplier")
     p.add_argument("--output-device", default=None, help="output device (e.g. CABLE Input)")
-    p.add_argument("--window-seconds", type=float, default=None, help="cap on one ASR request's audio (s): forced block when speech never pauses; also sets capture ring = this + 2 s")
-    p.add_argument("--asr-interval-ms", type=float, default=None, help="poll cadence of the ASR loop")
-    p.add_argument("--asr-stream", dest="asr_stream", action="store_true", default=None, help="stream ASR incrementally (SSE deltas)")
-    p.add_argument("--no-asr-stream", dest="asr_stream", action="store_false", help="batch ASR: one non-streaming request per utterance (after utterance_gap_ms)")
-    p.add_argument("--max-split-chars", type=int, default=None, help="force a cut at this many chars even without punctuation")
-    p.add_argument("--silence-threshold", type=float, default=None, help="fixed RMS threshold (energy(0.2s) below it counts as silence)")
-    p.add_argument("--sentence-gap-ms", type=float, default=None, help="sentence gap: silence this long ends a sentence (streaming: triggers the ASR call for it)")
-    p.add_argument("--utterance-gap-ms", type=float, default=None, help="utterance gap: silence this long ends the segment (flush / batch ASR / start playback)")
-    p.add_argument("--mute-during-tts", dest="mute_during_tts", action="store_true", default=None, help="gate ASR while TTS is playing")
-    p.add_argument("--no-mute-during-tts", dest="mute_during_tts", action="store_false", help="keep ASR running while TTS plays (TTS not played out loud)")
-    p.add_argument("--stream-emit-ms", type=float, default=None, help="streaming ASR: min interval between partial text emissions")
-    p.add_argument("--gap-ms", type=float, default=None, help="silence between TTS segments (0 when cloning)")
+    p.add_argument(
+        "--window-seconds",
+        type=float,
+        default=None,
+        help=(
+            "cap on one ASR request's audio (s): forced block when speech never "
+            "pauses; also sets capture ring = this + 2 s"
+        ),
+    )
+    p.add_argument(
+        "--asr-interval-ms", type=float, default=None, help="poll cadence of the ASR loop"
+    )
+    p.add_argument(
+        "--asr-stream",
+        dest="asr_stream",
+        action="store_true",
+        default=None,
+        help="stream ASR incrementally (SSE deltas)",
+    )
+    p.add_argument(
+        "--no-asr-stream",
+        dest="asr_stream",
+        action="store_false",
+        help="batch ASR: one non-streaming request per utterance (after utterance_gap_ms)",
+    )
+    p.add_argument(
+        "--max-split-chars",
+        type=int,
+        default=None,
+        help="force a cut at this many chars even without punctuation",
+    )
+    p.add_argument(
+        "--silence-threshold",
+        type=float,
+        default=None,
+        help="fixed RMS threshold (energy(0.2s) below it counts as silence)",
+    )
+    p.add_argument(
+        "--sentence-gap-ms",
+        type=float,
+        default=None,
+        help=(
+            "sentence gap: silence this long ends a sentence "
+            "(streaming: triggers the ASR call for it)"
+        ),
+    )
+    p.add_argument(
+        "--utterance-gap-ms",
+        type=float,
+        default=None,
+        help=(
+            "utterance gap: silence this long ends the segment (flush / batch ASR / start playback)"
+        ),
+    )
+    p.add_argument(
+        "--mute-during-tts",
+        dest="mute_during_tts",
+        action="store_true",
+        default=None,
+        help="gate ASR while TTS is playing",
+    )
+    p.add_argument(
+        "--no-mute-during-tts",
+        dest="mute_during_tts",
+        action="store_false",
+        help="keep ASR running while TTS plays (TTS not played out loud)",
+    )
+    p.add_argument(
+        "--stream-emit-ms",
+        type=float,
+        default=None,
+        help="streaming ASR: min interval between partial text emissions",
+    )
+    p.add_argument(
+        "--gap-ms", type=float, default=None, help="silence between TTS segments (0 when cloning)"
+    )
 
     args = p.parse_args(argv)
     for key, hard in HARD_DEFAULTS.items():

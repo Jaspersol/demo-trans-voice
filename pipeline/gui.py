@@ -26,8 +26,8 @@ import argparse
 import queue
 import sys
 import threading
-import traceback
 import tkinter as tk
+import traceback
 from pathlib import Path
 from tkinter import filedialog, ttk
 
@@ -40,46 +40,70 @@ from pipeline.config import (
 )
 from pipeline.tray import TrayIcon, tray_available
 
-TICK_MS = 150          # UI refresh (log drain + meter)
-MAX_LOG_LINES = 2000   # older lines are dropped; a long session must not grow forever
+TICK_MS = 150  # UI refresh (log drain + meter)
+MAX_LOG_LINES = 2000  # older lines are dropped; a long session must not grow forever
 DEFAULT_DEVICE = "（默认）"
 
 # (group title, column, [(field label, option key, kind)]) — kinds: str/int/
 # float mirror the config types, "bool" is a checkbox, "path" gets a browse
 # button, "input"/"output" become device pickers.
 _GROUPS: list[tuple[str, str, list[tuple[str, str, str]]]] = [
-    ("服务", "left", [
-        ("ASR 地址", "asr_url", "str"),
-        ("ASR 模型", "asr_model", "str"),
-        ("语言预填", "language", "str"),
-        ("TTS 地址", "tts_url", "str"),
-        ("TTS 语种", "tts_lang", "str"),
-        ("TTS worker 数", "tts_workers", "int"),
-        ("克隆参考音频", "speaker_ref", "path"),
-    ]),
-    ("停顿策略", "left", [
-        ("句间停顿 ms", "sentence_gap_ms", "float"),
-        ("语段结束 ms", "utterance_gap_ms", "float"),
-        ("单块上限 s", "window_seconds", "float"),
-        ("强制切分字数", "max_split_chars", "int"),
-        ("段间静音 ms", "gap_ms", "float"),
-    ]),
-    ("语音判定", "left", [
-        ("静音门限 RMS", "silence_threshold", "float"),
-    ]),
-    ("设备", "right", [
-        ("输入设备", "mic_device", "input"),
-        ("麦克风增益", "mic_gain", "float"),
-        ("输出设备", "output_device", "output"),
-    ]),
-    ("节奏", "right", [
-        ("有声轮询 ms", "asr_interval_ms", "float"),
-        ("流式节流 ms", "stream_emit_ms", "float"),
-    ]),
-    ("模式", "right", [
-        ("流式 ASR（一句一块）", "asr_stream", "bool"),
-        ("外放：说完再播 + 播放期停听", "mute_during_tts", "bool"),
-    ]),
+    (
+        "服务",
+        "left",
+        [
+            ("ASR 地址", "asr_url", "str"),
+            ("ASR 模型", "asr_model", "str"),
+            ("语言预填", "language", "str"),
+            ("TTS 地址", "tts_url", "str"),
+            ("TTS 语种", "tts_lang", "str"),
+            ("TTS worker 数", "tts_workers", "int"),
+            ("克隆参考音频", "speaker_ref", "path"),
+        ],
+    ),
+    (
+        "停顿策略",
+        "left",
+        [
+            ("句间停顿 ms", "sentence_gap_ms", "float"),
+            ("语段结束 ms", "utterance_gap_ms", "float"),
+            ("单块上限 s", "window_seconds", "float"),
+            ("强制切分字数", "max_split_chars", "int"),
+            ("段间静音 ms", "gap_ms", "float"),
+        ],
+    ),
+    (
+        "语音判定",
+        "left",
+        [
+            ("静音门限 RMS", "silence_threshold", "float"),
+        ],
+    ),
+    (
+        "设备",
+        "right",
+        [
+            ("输入设备", "mic_device", "input"),
+            ("麦克风增益", "mic_gain", "float"),
+            ("输出设备", "output_device", "output"),
+        ],
+    ),
+    (
+        "节奏",
+        "right",
+        [
+            ("有声轮询 ms", "asr_interval_ms", "float"),
+            ("流式节流 ms", "stream_emit_ms", "float"),
+        ],
+    ),
+    (
+        "模式",
+        "right",
+        [
+            ("流式 ASR（一句一块）", "asr_stream", "bool"),
+            ("外放：说完再播 + 播放期停听", "mute_during_tts", "bool"),
+        ],
+    ),
 ]
 
 
@@ -148,7 +172,7 @@ class VoiceGui(tk.Tk):
         self.bind("<Unmap>", self._on_unmap)
         self.after(TICK_MS, self._tick)
 
-    # -- layout --------------------------------------------------------------
+    # -- layout ---------------------------------------------------------------
 
     def _build(self) -> None:
         top = ttk.Frame(self, padding=(10, 8, 10, 0))
@@ -230,7 +254,7 @@ class VoiceGui(tk.Tk):
             self._vars[key] = var
         frame.columnconfigure(1, weight=1)
 
-    # -- config <-> form -----------------------------------------------------
+    # -- config <-> form ------------------------------------------------------
 
     def _load_into_form(self) -> None:
         self._config_var.set(str(self._config_path))
@@ -327,7 +351,7 @@ class VoiceGui(tk.Tk):
             for box in boxes:
                 box["values"] = [DEFAULT_DEVICE, *names]
 
-    # -- run / stop ----------------------------------------------------------
+    # -- run / stop -----------------------------------------------------------
 
     def _toggle(self) -> None:
         if self._worker is not None and self._worker.is_alive():
@@ -390,7 +414,7 @@ class VoiceGui(tk.Tk):
         if worker is not None:
             worker.join(timeout=10.0)
 
-    # -- minimize to tray ----------------------------------------------------
+    # -- minimize to tray -----------------------------------------------------
 
     def _on_unmap(self, event: tk.Event) -> None:
         """Minimizing hides the window into the notification area; closing it
@@ -454,7 +478,7 @@ class VoiceGui(tk.Tk):
                 self._quit()
                 return
 
-    # -- periodic UI work ----------------------------------------------------
+    # -- periodic UI work -----------------------------------------------------
 
     def _tick(self) -> None:
         self._drain_log()

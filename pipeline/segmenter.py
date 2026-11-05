@@ -1,6 +1,6 @@
 """Sentence segmenter for the pause-driven pipeline.
 
-Text arrives one *sentence block* at a time (the ASR call happenend because the
+Text arrives one *sentence block* at a time (the ASR call happened because the
 speaker paused), so the splitter only has to:
 
 1. Cut right after a sentence-final mark — ``?!`` kept from the model, plus the
@@ -57,14 +57,14 @@ class Segmenter:
 
     _buffer: str = field(default="", init=False)
 
-    # -- state ---------------------------------------------------------------
+    # -- state ----------------------------------------------------------------
 
     @property
     def empty(self) -> bool:
         """True when nothing is buffered (all text handed to TTS)."""
         return not self._buffer
 
-    # -- input ---------------------------------------------------------------
+    # -- input ----------------------------------------------------------------
 
     def push(self, text: str) -> list[str]:
         """Feed newly-transcribed text; return sentences ready for TTS."""
@@ -81,7 +81,7 @@ class Segmenter:
             self._buffer = ""
         return out
 
-    # -- internals -----------------------------------------------------------
+    # -- internals ------------------------------------------------------------
 
     def _drain(self) -> list[str]:
         sentences: list[str] = []

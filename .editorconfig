@@ -1,0 +1,14 @@
+root = true
+
+# Matches the ruff settings in pyproject.toml: LF, UTF-8, one trailing newline,
+# no trailing whitespace, 100-column target (4-space Python indent).
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{toml,md,yml,yaml,json}]
+indent_size = 2

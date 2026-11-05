@@ -24,7 +24,7 @@ import threading
 import time
 from ctypes import wintypes
 
-# -- win32 constants ---------------------------------------------------------
+# -- win32 constants ----------------------------------------------------------
 
 WM_DESTROY = 0x0002
 WM_LBUTTONUP = 0x0202
@@ -61,7 +61,10 @@ def tray_available() -> bool:
 if user32 is not None:
     user32.DefWindowProcW.restype = ctypes.c_ssize_t
     user32.DefWindowProcW.argtypes = [
-        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
     ]
     user32.CreateWindowExW.restype = wintypes.HWND
     user32.LoadIconW.restype = wintypes.HICON
@@ -136,7 +139,7 @@ class TrayIcon:
         self._error: Exception | None = None
         self._callback_message = 0x8000 + 1  # WM_APP + 1
 
-    # -- UI thread API -------------------------------------------------------
+    # -- UI thread API --------------------------------------------------------
 
     def start(self) -> None:
         """Spin up the tray thread; raises if the icon cannot be created."""
@@ -177,7 +180,7 @@ class TrayIcon:
             ack.wait(3.0)
         return result[0]
 
-    # -- tray thread ---------------------------------------------------------
+    # -- tray thread ----------------------------------------------------------
 
     def _run(self) -> None:
         try:
@@ -291,6 +294,8 @@ class TrayIcon:
             self.actions.put(action)
 
     def _add_icon(self) -> bool:
+        """Put the icon in the notification area (idempotent); False if the shell
+        refused it."""
         if self._visible:
             return True
         if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
@@ -299,6 +304,7 @@ class TrayIcon:
         return True
 
     def _remove_icon(self) -> bool:
+        """Take the icon out of the notification area (idempotent)."""
         if not self._visible:
             return True
         ok = bool(shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid)))

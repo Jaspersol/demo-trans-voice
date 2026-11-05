@@ -1,3 +1,11 @@
+# Style conventions for this repo — written here because there is no README yet:
+#   * docstrings and inline comments are English and explain *why* (constraint,
+#     trap, history), not what the line below already says;
+#   * anything a user reads stays Chinese: ``print`` lines, GUI labels, argparse
+#     help and user-facing errors. One message never mixes the two languages.
+#   * formatting/linting: ``ruff format`` + ``ruff check`` (config below). The
+#     runtime target is Python 3.11, which is also the PyInstaller build target.
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -14,17 +22,30 @@ dependencies = [
     "httpx>=0.28",
 ]
 
+# Two entry points: the console pipeline, and a windowed control panel that
+# Windows installs with a console-less launcher (no black window flashing
+# behind it).
 [project.scripts]
 trans-voice = "pipeline.app:main"
 
-# Windows installs a console-less launcher for this one, so no black window
-# flashes behind the control panel.
 [project.gui-scripts]
 trans-voice-gui = "pipeline.gui:main"
 
-# Frozen builds: `python -m PyInstaller trans-voice.spec` (see the spec header).
+# Build/dev extras: a frozen build is `python -m PyInstaller trans-voice.spec`
+# (see the spec header); that extra also installs the ruff used above.
 [project.optional-dependencies]
-build = ["pyinstaller>=6.10"]
+build = ["pyinstaller>=6.10", "ruff>=0.17"]
 
 [tool.setuptools]
 packages = ["pipeline"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The notes files carry hand-written snippets that illustrate a workflow, not
+# pipeline code, so the formatter must not rewrite them (extend-exclude keeps
+# ruff's own defaults for .venv/build/dist).
+extend-exclude = ["batch-speaker.md", "flow.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

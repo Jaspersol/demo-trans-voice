@@ -37,10 +37,13 @@ READ_TIMEOUT_S = 3.0
 
 
 def strip_metadata(text: str) -> str:
+    """Drop the ``language XXXX<asr_text>`` prefix that llama.cpp leaves in the text."""
     return METADATA_RE.sub("", text)
 
 
 def wav_base64(pcm: np.ndarray, sample_rate: int = 16_000) -> str:
+    """Encode the PCM as a 16-bit WAV and base64 it: the chat API takes the audio
+    inline, so no temp file is written (and none to clean up)."""
     buf = io.BytesIO()
     sf.write(buf, pcm, sample_rate, format="WAV", subtype="PCM_16")
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -51,9 +54,8 @@ class AsrRequest:
     """One snapshot window queued for transcription."""
 
     window_start: float  # stream-seconds where this snapshot begins
-    window_end: float    # stream-seconds where it ends (= caller's cursor)
+    window_end: float  # stream-seconds where it ends (= caller's cursor)
     pcm: np.ndarray
-
 
 
 @dataclass
@@ -83,7 +85,9 @@ class AsrClient:
         # take seconds on long windows. Read timeout stays short: a stalled
         # window is retried whole, blocking the loop for 10 s used to overflow
         # the ring buffer and drop up to its full capacity of speech.
-        self._client = httpx.Client(timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30.0, pool=2.0))
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30.0, pool=2.0)
+        )
 
     def _messages(self, audio_b64: str) -> list[dict]:
         content: list[dict] = [
@@ -131,11 +135,13 @@ class AsrClient:
 
 
 def _sse_content_deltas(lines: Iterator[str | bytes]) -> Iterator[str]:
+    """Yield the ``choices[0].delta.content`` text of an SSE ``data:`` stream,
+    skipping events without text and stopping at ``[DONE]``."""
     for raw in lines:
         line = raw.decode() if isinstance(raw, bytes) else raw
         if not line or not line.startswith("data: "):
             continue
-        data = line[len("data: "):]
+        data = line[len("data: ") :]
         if data.strip() == "[DONE]":
             return
         obj = json.loads(data)

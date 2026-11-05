@@ -1,0 +1,14 @@
+# Text files are stored and checked out as LF: the working tree used to be CRLF
+# here only because of core.autocrlf, so an editor round-trip rewrote whole
+# files. Binaries must never be normalised.
+* text=auto eol=lf
+
+*.wav binary
+*.dll binary
+*.pyd binary
+*.exe binary
+*.png binary
+*.ico binary
+*.icns binary
+*.db binary
+*.zip binary

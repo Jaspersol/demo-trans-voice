@@ -24,7 +24,6 @@ def resolve_device(sd, device, kind: str = "output") -> int | None:  # noqa: ANN
     return MicCapture._resolve_device(sd, device, kind=kind)
 
 
-
 class AudioPlayer:
     def __init__(
         self,
@@ -38,7 +37,8 @@ class AudioPlayer:
         self._device = device
         self._gap_ms = gap_ms
         self._channels = channels
-        self._pending: dict[int, dict] = {}  # seq -> {"rate": int, "chunks": [np.ndarray], "done": bool}
+        # seq -> {"rate": int, "chunks": [np.ndarray], "done": bool}
+        self._pending: dict[int, dict] = {}
         self._next_seq = 0
         self._cv = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -92,8 +92,8 @@ class AudioPlayer:
                 seg["done"] = True
             self._cv.notify()
 
-
     def close_queue(self) -> None:
+        """Wake the playback thread so it re-reads ``_stop`` (used by :meth:`stop`)."""
         with self._cv:
             self._cv.notify()
 
@@ -112,9 +112,11 @@ class AudioPlayer:
             self._stream.close()
             self._stream = None
 
-    # -- internals -----------------------------------------------------------
+    # -- internals ------------------------------------------------------------
 
     def _ensure_stream(self, rate: int):
+        """Return the device stream, reopening it only when ``rate`` differs from
+        the rate the current one was opened with."""
         if self._stream is not None and self._opened_rate == rate:
             return self._stream
         if self._stream is not None:
@@ -135,6 +137,8 @@ class AudioPlayer:
         return stream
 
     def _run(self) -> None:
+        """Playback thread: write each completed segment, in seq order, once its
+        seq comes up."""
         while not self._stop.is_set():
             item = self._next_ready()
             if item is None:

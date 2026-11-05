@@ -41,6 +41,7 @@ class TtsWorkerPool:
         self._speaker_b64: str | None = None
         if speaker_path:
             import base64
+
             with open(speaker_path, "rb") as fh:
                 self._speaker_b64 = base64.b64encode(fh.read()).decode("ascii")
         self._jobs: queue.Queue[tuple[int, str] | None] = queue.Queue()
@@ -48,10 +49,12 @@ class TtsWorkerPool:
         self._seq_lock = threading.Lock()
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
-        self._active = 0          # synthesis jobs currently in flight
+        self._active = 0  # synthesis jobs currently in flight
         self._active_lock = threading.Lock()
 
     def submit(self, sentence: str) -> int:
+        """Queue one sentence for synthesis; returns its seq, which is also the
+        playback order handle."""
         with self._seq_lock:
             seq = self._seq
             self._seq += 1
@@ -84,14 +87,13 @@ class TtsWorkerPool:
         for t in self._threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
 
-    # -- internals -----------------------------------------------------------
+    # -- internals ------------------------------------------------------------
 
     def _synthesize(self, seq: int, sentence: str) -> None:
         rate = 24_000
         byte_buf = b""  # carries partial floats across TCP chunks
         samples = np.zeros(0, dtype=np.float32)
-        body = {"input": sentence, "lang": self._lang,
-                "stream": True, "response_format": "pcm"}
+        body = {"input": sentence, "lang": self._lang, "stream": True, "response_format": "pcm"}
         if self._speaker_b64:
             body["speaker_ref_b64"] = self._speaker_b64
         with self._client.stream("POST", f"{self._url}/tts", json=body) as resp:
@@ -101,17 +103,18 @@ class TtsWorkerPool:
                 usable = len(byte_buf) - len(byte_buf) % 4
                 if usable == 0:
                     continue
-                samples = np.concatenate(
-                    [samples, np.frombuffer(byte_buf[:usable], dtype="<f4")])
+                samples = np.concatenate([samples, np.frombuffer(byte_buf[:usable], dtype="<f4")])
                 byte_buf = byte_buf[usable:]
                 while len(samples) >= self._chunk:
                     self._player.put(seq, samples[: int(self._chunk)], rate)
-                    samples = samples[int(self._chunk):]
+                    samples = samples[int(self._chunk) :]
         # always mark the segment final — an empty one is a tombstone, and
         # without it the player would wait for this seq forever
         self._player.put(seq, samples, rate, final=True)
 
     def _loop(self) -> None:
+        """One synthesis worker: pull a sentence, stream it to the player, and
+        land a tombstone if the request fails."""
         while not self._stop.is_set():
             try:
                 item = self._jobs.get(timeout=0.5)
