@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.png" width="120" alt="trans-voice logo">
+
 # trans-voice
 
 ### Real-time speech-to-speech: your voice comes back out in another voice, sentence by sentence, as you speak

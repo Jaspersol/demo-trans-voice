@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/logo.png" width="120" alt="trans-voice logo">
+
 # trans-voice
 
 ### 实时语音转语音：你边说，它边用另一个声音把话一句一句说回来
