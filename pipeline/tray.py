@@ -124,7 +124,7 @@ class TrayIcon:
 
     def __init__(
         self,
-        tooltip: str = "trans-voice 控制台",
+        tooltip: str = "DTV 控制台",
         actions: queue.Queue[str] | None = None,
     ) -> None:
         # the owner drains this from its own thread (the GUI polls it in a tick)

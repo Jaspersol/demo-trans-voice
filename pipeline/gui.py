@@ -147,7 +147,7 @@ class _QueueWriter:
 class VoiceGui(tk.Tk):
     def __init__(self, config_path: str | None = None) -> None:
         super().__init__()
-        self.title("trans-voice 控制台")
+        self.title("DTV 控制台")
         self.minsize(780, 560)
         self._config_path = Path(config_path) if config_path else default_config_path()
         self._config_var = tk.StringVar()
@@ -540,7 +540,7 @@ class VoiceGui(tk.Tk):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="trans-voice 控制台")
+    parser = argparse.ArgumentParser(description="DTV 控制台")
     parser.add_argument("-c", "--config", default=None, help="config.ini 路径")
     ns = parser.parse_args(argv)
     VoiceGui(config_path=ns.config).mainloop()
