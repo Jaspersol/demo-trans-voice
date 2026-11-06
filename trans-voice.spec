@@ -23,7 +23,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_dynamic_libs
 
 ROOT = Path(SPECPATH)
-OUT_NAME = "DTV"
+OUT_NAME = "DemoTransVoice"
 
 binaries = (
     collect_dynamic_libs("_sounddevice_data")   # portaudio*.dll
