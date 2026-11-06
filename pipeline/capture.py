@@ -11,12 +11,18 @@ Design:
 
 from __future__ import annotations
 
+import contextlib
+import re
 import threading
 
 import numpy as np
 
 SAMPLE_RATE = 16_000
 FRAME = 512  # samples per callback (~32 ms)
+
+# A plain number is a PortAudio device index ("3", "+3", " 3 "): matching it as
+# a name fragment used to pick whichever device happened to contain "3".
+_DEVICE_INDEX_RE = re.compile(r"[+-]?\d+")
 
 
 class RingBuffer:
@@ -134,10 +140,15 @@ class MicCapture:
         """Resolve a device id, or match by normalized name substring (ids are
         unstable across Windows re-enumerations; names survive). Normalization
         strips case and whitespace so 'Realtek(R)Audio' matches
-        'Realtek(R) Audio'."""
+        'Realtek(R) Audio'. A purely numeric string is an index, never a name
+        substring (a mic called 'USB Audio 3' must not swallow ``--mic-device 3``)."""
         if device is None or isinstance(device, int):
             return device
         device = str(device).strip()
+        if _DEVICE_INDEX_RE.fullmatch(device):
+            return int(device)
+        if not device:
+            raise ValueError(f"empty {kind} device value")
         want = _normalize_name(device)
         ch_key = "max_input_channels" if kind == "input" else "max_output_channels"
         matches = [
@@ -159,7 +170,15 @@ class MicCapture:
         self.ring.write(mono)
 
     def __enter__(self) -> MicCapture:
-        self._stream.start()
+        try:
+            self._stream.start()
+        except Exception:
+            # The stream object was already allocated in __init__: closing it
+            # here keeps a failed start from leaking the device handle (the
+            # caller only ever exits the context it actually entered).
+            with contextlib.suppress(Exception):
+                self._stream.close()
+            raise
         return self
 
     def __exit__(self, *exc) -> None:  # noqa: ANN002

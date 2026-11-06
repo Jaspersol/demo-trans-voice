@@ -20,7 +20,7 @@
 
 数据通道：`RingBuffer`（锁保护 float32）；`sentences: queue.Queue[str]`；播放器内部 `_pending: dict[seq, {rate, chunks, done}]`。
 
-启动顺序：先起播放器/`tts_pool`/`asr_worker`/`asr-loop`/`tts-pump`，最后才开麦克风（回调线程不会找不到消费者）。
+启动顺序：先在 `ExitStack` 里取得资源（麦克风设备解析 + 开流，这是唯一会因配置失败的一步），再起播放器/`tts_pool`/`asr_worker`/`asr-loop`/`tts-pump`，最后跑主等待循环。麦克风先于消费者是安全的：环缓冲保留 stream time 0 起的全部音频，消费者起来后从头读。任何一步失败（含设备打不开）都走 `run()` 的 `finally → shutdown()`，不会留下线程与 httpx 连接；`shutdown()` 幂等（`_stop` 已置位即返回），并 join 自己起的两个循环线程。
 
 ---
 
@@ -87,7 +87,7 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
 1. `end - start < MIN_BLOCK_S (0.3 s)` → `SKIPPED`（不值得一次请求）；
 2. `ring.read_since(start) is None` → 打印 `[asr] 音频窗口溢出,丢失 Xs — 重同步` 到 stderr，`SKIPPED`；
 3. `_speech_fraction(audio, threshold) < MIN_VOICED_FRACTION (0.15)` → `SKIPPED`（20 ms 帧 RMS ≥ 门限的占比；静止噪声与瞬态过不了）；
-4. `asr_worker.submit(start, end, audio)` 成功 → 记 `pending.append({"pause": pause, "pushed": 0})`，且**外放时 `player.set_hold(True)`**（新一段：先压住播放）→ `QUEUED`；
+4. `asr_worker.submit(start, end, audio)` 成功 → 记 `pending.append({"pause": pause, "pushed": ""})`（`pushed` = 已推送的文本前缀，见 §4.4），且**外放时 `player.set_hold(True)`**（新一段：先压住播放）→ `QUEUED`；
 5. 被拒（在途 ≥ `max_backlog=3`）→ `BUSY`，**不推进游标**：循环把该块的 `pause` 记进 `held_pause`，下一拍开头先重试它（重试会把这期间的新音频一并带上，代价是这句可能并进更长的块）。
 6. 窗口上限（`_submit_block`）：`end = min(now_s, start + 环容量 − 1 s)`，并返回"是否还有剩余"（`leftover`）；若 `start` 已被环挤掉（积压时长超过环容量），把窗口头前移到最老的可用音频并打印 `[asr] 积压:丢弃最早 Xs(环 10s),保留最近 Ys` —— 丢头保尾，旧行为（整块 `音频窗口溢出` 拒绝）会把最近这段也一起丢。
 
@@ -101,20 +101,21 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
      {"type": "input_audio", "input_audio": {"data": "<16 kHz WAV base64>"}}]},
    {"role": "assistant", "content": "language Chinese<asr_text>"}]}
 ```
-超时 `connect=2 s / read=3 s / write=30 s / pool=2 s`（卡住只阻塞连接，短读超时避免长时间堵住提交线程）。
+超时按请求模式分开：流式 `connect=2 s / read=3 s / write=30 s / pool=2 s`（每次读都会有 delta 证明还活着，短读超时能及时发现卡住的窗口）；批式整段请求在解码完成前没有任何输出，用 `batch_read_timeout`（默认 60 s）——沿用 3 s 会让正常的长段超时，该块被发布成空文本，音频直接丢掉，和"绝不丢语音"矛盾。
 - `transcribe_stream()`：逐行读 SSE（`data: ` 前缀、`[DONE]` 结束），产出 `choices[0].delta.content`；
 - `transcribe()`：`stream:false`，返回 `choices[0].message.content`；
 - 两者都用 `strip_metadata()` 去掉 `language XXXX<asr_text>` 前缀。
+- 未设 `language` 时这个前缀由模型自己吐，而且是**逐 token** 来的（`lang` → `language Chi` → `language Chinese<asr_text>`）：这些半截 head 和正文长得一模一样，`strip_metadata()` 这时还匹配不到。流式路径因此用 `gate_metadata()`：在标记完整前扣住不发布（`settled=False`），只有确认是完整标记（去掉）或确认不可能是标记（当正文）才放行。否则语言标签会被送进 segmenter/TTS，且调用方游标会被推进到它的长度，`raw[pushed:]` 把真正的开头吃掉。窗口结束时若标记已在流里，说明这窗只有标签、没有语音 → 发布空文本；标记不在则说明标签根本没写完，扣住的就是正文（如被窗口截断的 "Language is …" ）→ 照常发布，不丢语音。
 
 `AsrWorker(client, max_backlog=3, stream, emit_ms)`：单线程按序转写；在途 ≥3 时 `submit` 返回 `False`（调用方保留游标，下一拍重试同一段音频）。流式按 `stream_emit_ms` 节流投递 `partial=True`，结束投递 `partial=False`；批式每块只投一个 final；异常时投递该块的空 final 作为墓碑（不重试、不退避），并打印 `[asr] 请求失败 (Xs 音频): <err>` —— 没有这行的话，ASR 服务挂掉和"没话说"在日志里长得一模一样。`busy = _busy or bool(_jobs)`。
 
 ### 4.4 结果吸收
 **每拍最先做**这件事（在门控判定之前）：门控必须看到本段自己的文本/音频，而批式的结果在此之前的任何时刻都是不可见的。`for res in asr_worker.results()`（提交顺序）：
-- `chunk = normalize_punct(raw[blk["pushed"]:])`（**只取新增后缀**，partial 是累计文本）；`blk["pushed"] = len(raw)`；
+- `raw = strip_metadata(res.text)`（worker 已经门控过，这里再兜一层：bookkeeping 永不会进 segmenter/TTS）；`chunk = normalize_punct(raw[len(prev):])`（**只取新增后缀**，partial 是累计文本）；`blk["pushed"] = raw`。`pushed` 存的是**已推送的文本前缀**而不是长度：只有在 `raw.startswith(prev)` 成立时才切后缀，否则整段重推 —— 前缀变短只可能来自元数据修正，绝不能当成"这次读得比上次短"就把开头丢掉；
 - `final` 时 `pending.popleft()`；若该块 `pause=True` 且整块文本末尾不是 `CUT_PUNCT` 成员 → 给 chunk **补一个 `。`**（这就是"停顿即句界"的落地方式，模型自己的标点见 §5）；
 - 非空 chunk → `segmenter.push(chunk)` → 切出的句子进 `sentences`。
 
-**标点归一化 `normalize_punct`**：保留模型给的 `? ! ！ ？`；`。 、 ； ： , ; :` 与空白一律变 `，`（连续合并、首尾去逗号）。理由：模型对"被停顿截断的音频"会自行补标点，只有停顿才是可信的句界；TTS 仍能看到逗号作为韵律提示。
+**标点归一化 `normalize_punct`**：保留模型给的 `? ! ！ ？`；`。 、 ； ： , ; :` 一律变 `，`（连续合并、首尾去逗号）。理由：模型对"被停顿截断的音频"会自行补标点，只有停顿才是可信的句界；TTS 仍能看到逗号作为韵律提示。**空白不再一律变逗号**：只在两侧都不是拉丁字母/数字时才当 CJK 分句（`你好 世界` → `你好，世界`），拉丁词间/中英之间保留一个普通空格（`hello world`、`我用 Python 写`）——否则英文会被读成 `hello，world`；逗号后的空白、行首空白直接丢掉。
 
 ---
 
@@ -146,6 +147,7 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
 - `set_hold(True/False)`：hold 期间 `_next_ready` 只 `cv.wait(0.2)`、不返回任何段 → **不写音频、`is_playing` 保持 False**。`release()` = `set_hold(False)`（幂等）。
 - **上锁时机**：`run()` 启动时（外放）上一次；此后**每段的第一块提交时上锁**（`_call_asr` 内）。门控恢复（`_playback_drained`）时**不再上锁**——避免段内音频还在合成时被二次压住。
 - **设备流**：按采样率缓存并复用同一个 `OutputStream`（`_ensure_stream` 记住 `_stream`/`_opened_rate`），只有采样率变化才重开；`stop()` 停止并关闭它。每段重开一次会在每句上多花 20~240 ms（实测）并泄漏上一个流。
+- **播放失败不锁死门控**：`_playing` 只在流真的打开之后才置位（设备索引/名字错误时 `OutputStream` 直接抛）。整个写段包在 `try/except/finally` 里：失败时打印 `[tts] 播放失败: …`、`_drop_stream()` 掉线重开、`_playing`/`_busy_until` 清回 False，只有这一段被跳过 —— 否则 `is_playing` 永远为 True，`mute_during_tts` 会把麦克风永久门控住。`stop()` 先清门控状态、再 join（超时则保留音频流，不去关一个正在写的流）。
 - **释放时机**：语段结束（静默 ≥ `utterance_gap_ms`，流式/非流式同一阈值）且 `mute_during_tts=true` → `player.release()` + `gated = True`（开始停听）。此后**首块 PCM 一到即播**，后续段随到随播。
 - **停听/恢复**：`mute and gated` 时每拍检查 `_playback_drained(pending)`：
   `not pending`（没有已提交未吸收的块）**且** `not is_playing` **且** `not pending_audio` **且** `sentences.empty()` **且** `segmenter.empty` **且** `not tts_pool.busy` **且** `not asr_worker.busy`。
@@ -201,7 +203,7 @@ CLI：`--asr-stream/--no-asr-stream`、`--mute-during-tts/--no-mute-during-tts`�
 | 方法与路径 | `POST {asr_url}/v1/chat/completions` | `POST {tts_url}/tts` |
 | 载荷 | `model` + `messages`（`input_audio` base64 WAV 16 kHz + 助手预填 `language X<asr_text>`）+ `stream` | `input` / `lang` / `stream:true` / `response_format:"pcm"` / 可选 `speaker_ref_b64` |
 | 响应 | SSE `choices[0].delta.content`（或一次 `message.content`） | 24 kHz float32 原始 PCM 字节流（4 字节对齐） |
-| 超时 | connect 2 s / read 3 s / write 30 s | httpx 默认，`timeout=600 s` |
+| 超时 | connect 2 s / write 30 s；流式 read 3 s，批式 read 60 s（`batch_read_timeout`） | httpx 默认，`timeout=600 s` |
 | 端口（默认） | 8081 | 8082 |
 
 ---

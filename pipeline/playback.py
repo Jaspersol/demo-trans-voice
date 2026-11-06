@@ -9,6 +9,8 @@ blocks forever) and plays segments one by one.
 
 from __future__ import annotations
 
+import contextlib
+import sys
 import threading
 import time
 
@@ -104,24 +106,45 @@ class AudioPlayer:
     def stop(self) -> None:
         self._stop.set()
         self.close_queue()
-        if self._thread:
-            self._thread.join(timeout=5)
-            self._thread = None
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        # Reset the gate up front: whatever happens to the join below,
+        # is_playing must never stay True after a stop.
+        self._playing = False
+        self._busy_until = 0.0
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                # Still inside stream.write(): closing the device under it
+                # would make that write raise, so leave the stream alone (the
+                # process is exiting, the thread is a daemon).
+                print(
+                    f"[tts] 播放线程未在 5s 内退出,保留音频流: {thread.name}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+        # No writer left, so nothing can reopen the stream.
+        self._drop_stream()
 
     # -- internals ------------------------------------------------------------
+
+    def _drop_stream(self) -> None:
+        """Close and forget the device stream. A device that already went away
+        (unplugged, driver reset) must not raise out of cleanup."""
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        with contextlib.suppress(Exception):
+            stream.stop()
+        with contextlib.suppress(Exception):
+            stream.close()
 
     def _ensure_stream(self, rate: int):
         """Return the device stream, reopening it only when ``rate`` differs from
         the rate the current one was opened with."""
         if self._stream is not None and self._opened_rate == rate:
             return self._stream
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+        self._drop_stream()
         stream = self._sd.OutputStream(
             samplerate=rate,
             channels=self._channels,
@@ -129,7 +152,12 @@ class AudioPlayer:
             device=resolve_device(self._sd, self._device, kind="output"),
             blocksize=0,  # let PortAudio pick low-latency
         )
-        stream.start()
+        try:
+            stream.start()
+        except Exception:
+            with contextlib.suppress(Exception):
+                stream.close()
+            raise
         # keep it: the player reuses one device stream for every segment of
         # that rate (otherwise each sentence opens a new one and leaks the old)
         self._stream = stream
@@ -147,9 +175,15 @@ class AudioPlayer:
                 continue
             seq, seg = item
             rate = seg["rate"]
-            self._playing = True
-            stream = self._ensure_stream(rate)
+            playing = False
             try:
+                # Open the device BEFORE raising _playing. Opening used to fail
+                # outside the try, leaving is_playing True forever — with
+                # mute_during_tts that gates the mic for the rest of the run.
+                stream = self._ensure_stream(rate)
+                playing = True
+                with self._cv:
+                    self._playing = True
                 for pcm in seg["chunks"]:
                     stream.write(np.ascontiguousarray(pcm.reshape(-1, 1)))
                 gap = int(self._gap_ms / 1000.0 * rate)
@@ -161,13 +195,19 @@ class AudioPlayer:
                 # after the loop. Adding written/rate here kept the gate
                 # closed for the whole segment length after it had ended.
                 self._busy_until = time.monotonic() + self._drain_ms / 1000.0
-            except Exception:
-                pass
+            except Exception as exc:
+                # Drop the stream so the next segment reopens it (a device that
+                # comes back keeps working) and clear the gate: a lost segment
+                # must not silence the mic. Only this segment is skipped.
+                print(f"[tts] 播放失败: {exc!r}", file=sys.stderr, flush=True)
+                playing = False
+                self._busy_until = 0.0
+                self._drop_stream()
             finally:
                 with self._cv:
                     self._next_seq = seq + 1
                     self._pending.pop(seq, None)
-                    self._playing = bool(self._pending)
+                    self._playing = playing and bool(self._pending)
 
     def _next_ready(self):
         """Wait for completed segment ``next_seq``. Segments arrive strictly

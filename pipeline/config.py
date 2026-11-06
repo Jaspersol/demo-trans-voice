@@ -245,9 +245,23 @@ def parse_args_with_config(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="3s reference wav for voice cloning (local path)",
     )
-    p.add_argument("--mic-device", default=None, help="input device index/name")
+    p.add_argument(
+        "--mic-device",
+        default=None,
+        help=(
+            "input device: PortAudio index (e.g. 3) or name fragment "
+            "(case/space-insensitive); a plain number is always an index"
+        ),
+    )
     p.add_argument("--mic-gain", type=float, default=None, help="software mic gain multiplier")
-    p.add_argument("--output-device", default=None, help="output device (e.g. CABLE Input)")
+    p.add_argument(
+        "--output-device",
+        default=None,
+        help=(
+            "output device: PortAudio index (e.g. 3) or name fragment "
+            "(e.g. CABLE Input); a plain number is always an index"
+        ),
+    )
     p.add_argument(
         "--window-seconds",
         type=float,

@@ -27,6 +27,7 @@ Threads:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import queue
 import signal
 import sys
@@ -37,7 +38,7 @@ from enum import Enum
 
 import numpy as np
 
-from pipeline.asr_client import AsrClient, AsrWorker
+from pipeline.asr_client import AsrClient, AsrWorker, strip_metadata
 from pipeline.capture import SAMPLE_RATE, MicCapture, RingBuffer
 from pipeline.config import parse_args_with_config, resolve_path
 from pipeline.playback import AudioPlayer
@@ -123,7 +124,7 @@ class Pipeline:
         called = False  # this quiet span already made its ASR call
         dirty = False  # something happened since the last utterance end
         quiet_since: float | None = None
-        pending: deque[dict] = deque()  # per submitted block: {pause, pushed}
+        pending: deque[dict] = deque()  # per block: {pause, pushed: already-pushed text prefix}
         gated = False  # speaker output: playing, so stop listening
         gated_speech = False  # speech arrived while gated: it is skipped
         ambient_log_at = time.monotonic() + 1.0
@@ -146,9 +147,17 @@ class Pipeline:
                 if not pending:  # result without a tracked block (shouldn't happen)
                     continue
                 blk = pending[0]
-                raw = res.text
-                chunk = normalize_punct(raw[blk["pushed"] :])
-                blk["pushed"] = len(raw)
+                # Partial results repeat the window's text so far, so only the
+                # new suffix is pushed; the sentence boundary is appended once,
+                # on the block's final result. The worker already gates the
+                # language metadata, but strip again here: bookkeeping must
+                # never reach the segmenter/TTS, and `pushed` is a text prefix
+                # (not a length) so a re-stripped head cannot be mistaken for
+                # a short read and cut off the beginning of the transcript.
+                raw = strip_metadata(res.text)
+                prev = blk["pushed"]
+                chunk = normalize_punct(raw[len(prev) :] if raw.startswith(prev) else raw)
+                blk["pushed"] = raw
                 if not res.partial:
                     pending.popleft()
                     if blk["pause"]:
@@ -393,7 +402,7 @@ class Pipeline:
             return CallOutcome.SKIPPED
         if not self.asr_worker.submit(start, end, audio):
             return CallOutcome.BUSY
-        pending.append({"pause": pause, "pushed": 0})
+        pending.append({"pause": pause, "pushed": ""})
         if self.hold_mode:
             # a new segment: buffer its audio until the utterance ends
             self.player.set_hold(True)
@@ -447,30 +456,47 @@ class Pipeline:
             self.tts_pool.submit(sentence)
 
     def run(self) -> None:
-        # Start every consuming thread BEFORE opening the mic stream: the
-        # capture callback (audio thread) writes into the ring immediately,
-        # and it must never find a consumer missing.
+        # Acquire every resource first, then start the consuming threads. The
+        # mic device is the one step that fails on bad config (unknown index or
+        # name, PortAudio refusing the stream): it used to sit *after* the
+        # threads were started and *outside* the try, so its exception escaped
+        # run() without ever reaching shutdown() — leaving worker threads and
+        # the httpx pools alive. It is now inside the ExitStack, and every exit
+        # path (error, Ctrl+C, normal stop) funnels through shutdown().
+        # Capture-before-consumers is safe: the ring buffer keeps the audio
+        # from stream time 0 until asr_loop reads it.
         self._install_sigint()
-        if self._stop.is_set():  # stopped before the stream was even opened
-            return
-        if self.hold_mode:
-            self.player.set_hold(True)  # play only when the segment ended
-        self.player.start()
-        self.tts_pool.start()
-        self.asr_worker.start()
-        threads = [
-            threading.Thread(target=self.asr_loop, name="asr-loop", daemon=True),
-            threading.Thread(target=self.tts_pump, name="tts-pump", daemon=True),
-        ]
-        for t in threads:
-            t.start()
-        self._threads = threads
-
-        with MicCapture(self.ring, device=self.args.mic_device, gain=self.args.mic_gain):
-            print("running — Ctrl+C to stop", flush=True)
-            while not self._stop.is_set():
-                time.sleep(0.2)
-        self.shutdown()
+        try:
+            with contextlib.ExitStack() as stack:
+                if self._stop.is_set():  # stopped before anything was acquired
+                    return
+                capture = MicCapture(
+                    self.ring, device=self.args.mic_device, gain=self.args.mic_gain
+                )
+                stack.enter_context(capture)
+                if self.hold_mode:
+                    self.player.set_hold(True)  # play only when the segment ended
+                self.player.start()
+                self.tts_pool.start()
+                self.asr_worker.start()
+                threads = [
+                    threading.Thread(target=self.asr_loop, name="asr-loop", daemon=True),
+                    threading.Thread(target=self.tts_pump, name="tts-pump", daemon=True),
+                ]
+                for t in threads:
+                    t.start()
+                self._threads = threads
+                print("running — Ctrl+C to stop", flush=True)
+                while not self._stop.is_set():
+                    time.sleep(0.2)
+        except Exception as exc:
+            # Chinese, user-facing: a device/startup failure is a configuration
+            # problem, not an internal bug. The traceback still follows from the
+            # re-raise for whoever needs the detail.
+            print(f"[pipeline] 启动失败: {exc}", file=sys.stderr, flush=True)
+            raise
+        finally:
+            self.shutdown()
 
     def _install_sigint(self) -> None:
         """Ctrl+C stops the CLI; a GUI runs this on a worker thread, where
@@ -482,6 +508,8 @@ class Pipeline:
         self.shutdown()
 
     def shutdown(self) -> None:
+        """Stop everything; safe to call twice (signal handler, GUI Stop, and
+        run()'s finally all land here — the first call wins)."""
         if self._stop.is_set():
             return
         self._stop.set()
@@ -490,6 +518,11 @@ class Pipeline:
         self.tts_pool.stop()
         self.player.close_queue()
         self.player.stop()
+        # Join the loop threads we started from here: they read the ring and the
+        # sentence queue, so nothing they touch may outlive them.
+        for t in self._threads:
+            if t is not threading.current_thread():
+                t.join(timeout=5.0)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

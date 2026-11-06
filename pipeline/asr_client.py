@@ -31,14 +31,57 @@ import httpx
 import numpy as np
 import soundfile as sf
 
-METADATA_RE = re.compile(r"language\s+\S+?<asr_text>\s*")
+# Case-insensitive on purpose: `gate_metadata` holds a window back while this
+# prefix may still be streaming in, so the pattern that *strips* it must match
+# the same spellings the gate recognises — otherwise an uppercase "Language"
+# would be held and then published as an empty window (dropped speech).
+METADATA_RE = re.compile(r"language\s+\S+?<asr_text>\s*", re.IGNORECASE)
 
+# Read timeout for one SSE read of a *streaming* request: the model keeps
+# emitting, so a silent 3 s means a stalled window, which is retried whole.
 READ_TIMEOUT_S = 3.0
+# Read timeout for a *batch* (whole-segment) request. It has no intermediate
+# output to prove liveness: the server is silent for the entire decode. The 3 s
+# streaming value dropped every non-trivial utterance (empty text -> no audio,
+# contradicting "never drops speech"), and it is only the *read* timeout, so a
+# dead connection still fails. Decode may take tens of seconds on a long window.
+BATCH_READ_TIMEOUT_S = 60.0
+
+# The metadata prefix streams token by token ("lang", "language Chi",
+# "language Chinese<asr_text>"), so an incomplete head is indistinguishable
+# from text until the ``<asr_text>`` marker arrives or the shape is disproved.
+_METADATA_HINT_RE = re.compile(r"language(?:\s+\S{0,32})?(?:<[a-z_]*)?\s*", re.IGNORECASE)
+_LANGUAGE_WORD = "language"
 
 
 def strip_metadata(text: str) -> str:
     """Drop the ``language XXXX<asr_text>`` prefix that llama.cpp leaves in the text."""
     return METADATA_RE.sub("", text)
+
+
+def gate_metadata(raw: str) -> tuple[str, bool]:
+    """Split one window's accumulated stream text into ``(text, settled)``.
+
+    ``settled=False`` means ``raw`` may still be turning into the
+    ``language XXXX<asr_text>`` bookkeeping line, and nothing may be published
+    yet: while the prefix streams in, a partial head ("lang", "language Chi")
+    looks exactly like a transcript. Sending it on would hand the language tag
+    to the segmenter/TTS *and* advance the caller's cursor to its length, so
+    the first real characters would be dropped by ``text[pushed:]``.
+
+    Settled means either the complete marker was seen and stripped, or the
+    text cannot become a metadata line any more (a third word, unrelated
+    punctuation, ...), in which case it is ordinary transcript."""
+    if METADATA_RE.match(raw):
+        return METADATA_RE.sub("", raw, count=1), True
+    head = raw.lstrip()
+    if head:
+        low = head.lower()
+        # A bare prefix of the word ("l".."langua") or the still-open shape
+        # "language <one word>" (possibly with a partial marker).
+        if _LANGUAGE_WORD.startswith(low) or _METADATA_HINT_RE.fullmatch(low):
+            return "", False
+    return strip_metadata(raw), True
 
 
 def wav_base64(pcm: np.ndarray, sample_rate: int = 16_000) -> str:
@@ -76,18 +119,24 @@ class AsrClient:
         language: str | None = None,
         connect_timeout: float = 2.0,
         read_timeout: float = READ_TIMEOUT_S,
+        batch_read_timeout: float = BATCH_READ_TIMEOUT_S,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.language = language
         # A hung server must freeze the pipeline for connect only, not for a
         # global 30 s: connect failure is a fast error; decode may legitimately
-        # take seconds on long windows. Read timeout stays short: a stalled
-        # window is retried whole, blocking the loop for 10 s used to overflow
-        # the ring buffer and drop up to its full capacity of speech.
-        self._client = httpx.Client(
-            timeout=httpx.Timeout(connect=connect_timeout, read=read_timeout, write=30.0, pool=2.0)
+        # take seconds on long windows. The per-read timeout is what separates
+        # the two modes: streaming keeps proving liveness with every delta
+        # (short read timeout catches a stalled window), a batch request is
+        # silent for its whole decode and gets the long one.
+        self._stream_timeout = httpx.Timeout(
+            connect=connect_timeout, read=read_timeout, write=30.0, pool=2.0
         )
+        self._batch_timeout = httpx.Timeout(
+            connect=connect_timeout, read=batch_read_timeout, write=30.0, pool=2.0
+        )
+        self._client = httpx.Client(timeout=self._stream_timeout)
 
     def _messages(self, audio_b64: str) -> list[dict]:
         content: list[dict] = [
@@ -125,7 +174,9 @@ class AsrClient:
             "messages": self._messages(wav_base64(pcm, sample_rate)),
             "stream": False,
         }
-        resp = self._client.post(f"{self.base_url}/v1/chat/completions", json=payload)
+        resp = self._client.post(
+            f"{self.base_url}/v1/chat/completions", json=payload, timeout=self._batch_timeout
+        )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
@@ -252,19 +303,33 @@ class AsrWorker:
     def _transcribe_streaming(self, job: AsrRequest) -> None:
         """Publish the growing text of one window as partial results."""
         seen = ""
+        text = ""
+        settled = False
         emitted_at = 0.0
         for delta in self._client.transcribe_stream(job.pcm):
             seen += delta
+            if settled:
+                text = strip_metadata(seen).strip()
+            else:
+                text, settled = gate_metadata(seen)
+                text = text.strip()
+                if not settled:
+                    # still the language prefix streaming in: publish nothing,
+                    # the caller's cursor must not advance past it
+                    continue
             now = time.monotonic()
             if self._emit_s and now - emitted_at < self._emit_s:
                 continue
             emitted_at = now
-            # strip_metadata also inside a window: the model may prefix its
-            # first delta with the language metadata line
-            text = strip_metadata(seen).strip()
             if text:
                 self._publish(job, text, partial=True)
-        self._publish(job, strip_metadata(seen).strip(), partial=False)
+        # The stream can end inside the metadata head. If the marker is there the
+        # window was tag-only (no speech): publish nothing instead of the tag.
+        # Without it the prefix never completed, so it was not metadata but the
+        # beginning of a transcript ("Language is ..." truncated by the window):
+        # publish it rather than dropping the window.
+        final = strip_metadata(seen).strip() if settled or "<asr_text>" not in seen else ""
+        self._publish(job, final, partial=False)
 
     def _publish(self, job: AsrRequest, text: str, partial: bool) -> None:
         with self._wake:

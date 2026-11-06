@@ -33,22 +33,46 @@ COMMA = "，"
 DEFAULTS = {"max_chars": 40}
 
 
+def _is_latin_word(ch: str) -> bool:
+    """ASCII letter or digit. A space next to one is a word separator, never a
+    clause break: converting it to ``,`` makes TTS read "hello，world"."""
+    return ch.isascii() and ch.isalnum()
+
+
 def normalize_punct(text: str) -> str:
     """Keep ``?``/``!``, downgrade everything else to a comma's role.
 
     Returns the text with ``。、；：`` etc. replaced by ``,`` so the splitter
-    (and TTS) sees a clause break instead of a sentence end. Whitespace runs are
-    collapsed."""
+    (and TTS) sees a clause break instead of a sentence end.
+
+    Whitespace is only turned into that comma where it is a CJK clause break
+    (non-Latin neighbours on both sides, e.g. "你好 世界"); between or beside
+    Latin words it stays one plain space, and runs of it collapse."""
     out: list[str] = []
+    space = False  # a whitespace run is pending its right neighbour
     for ch in text:
+        if ch.isspace():
+            space = True
+            continue
         if ch in "?!！？":
             out.append(ch)
-        elif ch in _SOFTENED or ch.isspace():
+        elif ch in _SOFTENED:
             if out and out[-1] != COMMA:
                 out.append(COMMA)
         else:
+            if space:
+                space = False
+                left = out[-1] if out else ""
+                # after a comma the break already exists; at the start, drop it
+                if left and left != COMMA:
+                    keep = _is_latin_word(left) or _is_latin_word(ch)
+                    if keep:
+                        out.append(" ")
+                    elif left not in CUT_PUNCT:
+                        # `?`/`!` already end the clause: no comma after it
+                        out.append(COMMA)
             out.append(ch)
-    return "".join(out).strip(COMMA)
+    return "".join(out).strip(f" {COMMA}")
 
 
 @dataclass
